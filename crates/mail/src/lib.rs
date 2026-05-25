@@ -8,9 +8,11 @@
 pub mod error;
 pub mod snailmail;
 pub mod storage;
+pub mod transport;
 
 pub use error::{MailError, Result};
 pub use snailmail::{
     Envelope, FilterVerdict, Headers, Mailbox, Message, MessageFilter, NullFilter,
 };
 pub use storage::{DeliveryOutcome, MailDeliveryAgent, MailStore, MemoryMailStore, StoredMessage};
+pub use transport::{SmtpCommand, SmtpReply, SmtpSession};
