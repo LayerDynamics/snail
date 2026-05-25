@@ -1,0 +1,19 @@
+[package]
+name = "network"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+utilities.workspace = true
+telemetry.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+hickory-resolver.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pemfile.workspace = true
+
+[lints]
+workspace = true

@@ -4,6 +4,7 @@ members = [
     "crates/utilities",
     "services/telemetry",
     "crates/mail",
+    "crates/network",
 ]
 
 [workspace.package]
@@ -28,9 +29,17 @@ opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "trace"] }
 opentelemetry-stdout = "0.27"
 tracing-opentelemetry = "0.28"
 
+# Async runtime + networking (m9)
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time"] }
+hickory-resolver = "0.24"
+rustls = "0.23"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+
 # Internal crates
 utilities = { path = "crates/utilities" }
 telemetry = { path = "services/telemetry" }
+network = { path = "crates/network" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
