@@ -7,5 +7,5 @@
 pub mod config;
 pub mod error;
 
-// pub use config::Config;             // enabled in m3
+pub use config::Config;
 pub use error::{Result, UtilError};
