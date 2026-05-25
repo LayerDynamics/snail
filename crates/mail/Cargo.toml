@@ -1,0 +1,15 @@
+[package]
+name = "mail"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+utilities.workspace = true
+telemetry.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

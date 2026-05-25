@@ -3,7 +3,7 @@ resolver = "3"
 members = [
     "crates/utilities",
     "services/telemetry",
-    # "crates/mail"         -> added in m8
+    "crates/mail",
 ]
 
 [workspace.package]
