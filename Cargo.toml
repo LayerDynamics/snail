@@ -7,6 +7,7 @@ members = [
     "crates/network",
     "crates/security",
     "crates/identity",
+    "crates/access",
 ]
 
 [workspace.package]
@@ -54,6 +55,8 @@ telemetry = { path = "services/telemetry" }
 network = { path = "crates/network" }
 security = { path = "crates/security" }
 identity = { path = "crates/identity" }
+mail = { path = "crates/mail" }
+access = { path = "crates/access" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
