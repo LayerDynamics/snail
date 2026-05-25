@@ -8,4 +8,4 @@ pub mod config;
 pub mod error;
 
 // pub use config::Config;             // enabled in m3
-// pub use error::{Result, UtilError}; // enabled in m2
+pub use error::{Result, UtilError};
