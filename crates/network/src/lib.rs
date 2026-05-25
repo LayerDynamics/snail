@@ -8,4 +8,9 @@ pub mod dns;
 pub mod error;
 pub mod tls;
 
+pub use dns::{
+    AddressRecord, DkimRecord, DmarcPolicy, DmarcRecord, DnsResolver, HickoryResolver, MxRecord,
+    PtrRecord, TxtRecord,
+};
 pub use error::{NetworkError, Result};
+pub use tls::TlsConfig;
