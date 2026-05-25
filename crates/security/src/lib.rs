@@ -1,12 +1,13 @@
 //! Cryptography and connection policy for the Snail mail server: password
 //! hashing, secret encryption, credential storage, firewall, and audit logging.
 
+pub mod audit;
 pub mod credential;
 pub mod encryption;
 pub mod error;
 pub mod firewall;
-// pub mod audit;       -> m10 T5
 
+pub use audit::{AuditConfig, AuditEvent, AuditLog, AuditManager};
 pub use credential::{
     AuthOutcome, Credential, CredentialReceiver, CredentialStore, MemoryCredentialStore,
 };
