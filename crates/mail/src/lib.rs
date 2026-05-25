@@ -6,11 +6,13 @@
 //! of milestone m12.
 
 pub mod error;
+pub mod security;
 pub mod snailmail;
 pub mod storage;
 pub mod transport;
 
 pub use error::{MailError, Result};
+pub use security::{ContentScanner, MailCerts, TlsPolicy};
 pub use snailmail::{
     Envelope, FilterVerdict, Headers, Mailbox, Message, MessageFilter, NullFilter,
 };
