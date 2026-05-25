@@ -1,0 +1,16 @@
+[package]
+name = "telemetry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "telemetry"
+path = "src/lib.rs"
+
+[dependencies]
+# Added per-task as used: tracing + OpenTelemetry stack in m6, anyhow in m7.
+
+[lints]
+workspace = true

@@ -2,7 +2,7 @@
 resolver = "3"
 members = [
     "crates/utilities",
-    # "services/telemetry"  -> added in m4
+    "services/telemetry",
     # "crates/mail"         -> added in m8
 ]
 
@@ -30,7 +30,7 @@ tracing-opentelemetry = "0.28"
 
 # Internal crates
 utilities = { path = "crates/utilities" }
-# telemetry = { path = "services/telemetry" }  -> added in m4 (manifest created then)
+telemetry = { path = "services/telemetry" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
