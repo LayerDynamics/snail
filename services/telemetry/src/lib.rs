@@ -8,3 +8,5 @@ pub mod data;
 pub mod exporters;
 pub mod listeners;
 pub mod otel;
+
+pub use data::{ExporterKind, TelemetryConfig};
