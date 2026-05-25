@@ -1,0 +1,17 @@
+[package]
+name = "identity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+utilities.workspace = true
+telemetry.workspace = true
+security.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+base64.workspace = true
+
+[lints]
+workspace = true
