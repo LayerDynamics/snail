@@ -9,6 +9,10 @@ publish = false
 name = "telemetry"
 path = "src/lib.rs"
 
+[[bin]]
+name = "telemetry"
+path = "src/main.rs"
+
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
@@ -18,7 +22,7 @@ opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry-stdout.workspace = true
-# anyhow added in m7 for the binary.
+anyhow.workspace = true
 
 [lints]
 workspace = true
