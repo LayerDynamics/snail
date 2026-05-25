@@ -15,4 +15,6 @@ pub use snailmail::{
     Envelope, FilterVerdict, Headers, Mailbox, Message, MessageFilter, NullFilter,
 };
 pub use storage::{DeliveryOutcome, MailDeliveryAgent, MailStore, MemoryMailStore, StoredMessage};
-pub use transport::{SmtpCommand, SmtpReply, SmtpSession};
+pub use transport::{
+    InboundCollector, InboundResult, Mta, RelayScript, Route, SmtpCommand, SmtpReply, SmtpSession,
+};
