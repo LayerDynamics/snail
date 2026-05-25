@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 utilities.workspace = true
 telemetry.workspace = true
+thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 
