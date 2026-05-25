@@ -4,7 +4,7 @@
 pub mod credential;
 pub mod encryption;
 pub mod error;
-// pub mod firewall;    -> m10 T4
+pub mod firewall;
 // pub mod audit;       -> m10 T5
 
 pub use credential::{
@@ -12,3 +12,4 @@ pub use credential::{
 };
 pub use encryption::{PasswordHasher, SecretCipher};
 pub use error::{Result, SecurityError};
+pub use firewall::{Decision, DenyReason, Firewall, FirewallConfig, FirewallManager};
