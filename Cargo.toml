@@ -1,0 +1,40 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/utilities",
+    # "services/telemetry"  -> added in m4
+    # "crates/mail"         -> added in m8
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[workspace.dependencies]
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Tracing core — stable API, pinned exactly
+tracing = "=0.1.41"
+tracing-subscriber = { version = "=0.3.19", features = ["env-filter", "fmt", "json"] }
+
+# OpenTelemetry — ONE cohesive cohort (these break in lockstep; do not mix minors)
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["trace"] }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "trace"] }
+opentelemetry-stdout = "0.27"
+tracing-opentelemetry = "0.28"
+
+# Internal crates
+utilities = { path = "crates/utilities" }
+# telemetry = { path = "services/telemetry" }  -> added in m4 (manifest created then)
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
