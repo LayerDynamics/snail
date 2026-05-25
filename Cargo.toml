@@ -5,6 +5,7 @@ members = [
     "services/telemetry",
     "crates/mail",
     "crates/network",
+    "crates/security",
 ]
 
 [workspace.package]
@@ -38,10 +39,16 @@ tokio-rustls = "0.26"
 rustls-pemfile = "2"
 rcgen = "0.13"
 
+# Security / crypto (m10)
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+governor = "0.6"
+
 # Internal crates
 utilities = { path = "crates/utilities" }
 telemetry = { path = "services/telemetry" }
 network = { path = "crates/network" }
+security = { path = "crates/security" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

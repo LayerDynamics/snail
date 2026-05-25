@@ -1,0 +1,18 @@
+[package]
+name = "security"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+utilities.workspace = true
+telemetry.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+argon2.workspace = true
+chacha20poly1305.workspace = true
+governor.workspace = true
+
+[lints]
+workspace = true
