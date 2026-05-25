@@ -10,7 +10,15 @@ name = "telemetry"
 path = "src/lib.rs"
 
 [dependencies]
-# Added per-task as used: tracing + OpenTelemetry stack in m6, anyhow in m7.
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-opentelemetry.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry-stdout.workspace = true
+# anyhow added in m7 for the binary.
 
 [lints]
 workspace = true

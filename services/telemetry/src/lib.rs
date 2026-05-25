@@ -9,4 +9,10 @@ pub mod exporters;
 pub mod listeners;
 pub mod otel;
 
+// The scaffold names one module directory `lib/`; a module path of `telemetry::lib`
+// would read like a typo, so the directory is mounted under the saner name `core_api`.
+#[path = "lib/mod.rs"]
+mod core_api;
+
+pub use core_api::{TelemetryError, TelemetryGuard, init};
 pub use data::{ExporterKind, TelemetryConfig};
