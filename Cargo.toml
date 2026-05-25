@@ -31,6 +31,7 @@ tracing-opentelemetry = "0.28"
 
 # Async runtime + networking (m9)
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time"] }
+async-trait = "0.1"
 hickory-resolver = "0.24"
 rustls = "0.23"
 tokio-rustls = "0.26"

@@ -824,6 +824,7 @@ dependencies = [
 name = "network"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "hickory-resolver",
  "rustls",
  "rustls-pemfile",

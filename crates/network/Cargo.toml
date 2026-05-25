@@ -10,6 +10,7 @@ utilities.workspace = true
 telemetry.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+async-trait.workspace = true
 hickory-resolver.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true

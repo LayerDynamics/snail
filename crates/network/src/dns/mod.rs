@@ -4,6 +4,7 @@
 pub mod a;
 pub mod dkim;
 pub mod dmark;
+pub mod lookup;
 pub mod mx;
 pub mod reverse;
 pub mod txt;
@@ -11,6 +12,7 @@ pub mod txt;
 pub use a::AddressRecord;
 pub use dkim::DkimRecord;
 pub use dmark::{DmarcPolicy, DmarcRecord};
+pub use lookup::DnsResolver;
 pub use mx::MxRecord;
 pub use reverse::PtrRecord;
 pub use txt::TxtRecord;
