@@ -315,4 +315,26 @@ mod tests {
         let report = relay_to(&addr, "h", &message()).await.unwrap();
         assert!(matches!(report, RelayReport::Deferred { code: 0, .. }));
     }
+
+    #[tokio::test]
+    #[ignore = "hits live DNS + the network; run with --ignored"]
+    async fn relay_live_mx_path() {
+        // `example.com` is reserved and accepts no mail, so this exercises the
+        // live resolver (MX lookup → A fallback) and connect handling without
+        // ever delivering a message.
+        let resolver = network::HickoryResolver::from_system().unwrap();
+        let probe = Message::parse(
+            Envelope::new(
+                Some(Mailbox::parse("postmaster@snail.invalid").unwrap()),
+                vec![Mailbox::parse("nobody@example.com").unwrap()],
+            ),
+            b"Subject: probe\r\n\r\nignored",
+        )
+        .unwrap();
+        let report = relay(&resolver, "snail.invalid", 25, &probe).await;
+        assert!(
+            !matches!(report, RelayReport::Delivered),
+            "example.com must not accept mail, got {report:?}"
+        );
+    }
 }

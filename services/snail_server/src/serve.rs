@@ -6,6 +6,7 @@
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use access::{
     ImapCommand, ImapSession, MsaSession, Pop3Session, PopCommand, PopReply, TaggedCommand,
@@ -13,9 +14,14 @@ use access::{
 use mail::{InboundCollector, SmtpCommand, SmtpSession};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 use tokio_rustls::server::TlsStream;
 
 use crate::server::Server;
+use crate::worker::spawn_relay_worker;
+
+/// How often the relay worker scans the spool for due messages.
+const RELAY_WORKER_TICK: Duration = Duration::from_secs(30);
 
 /// Bind addresses for the protocol listeners.
 #[derive(Debug, Clone)]
@@ -26,6 +32,8 @@ pub struct Listeners {
     pub pop3: String,
     /// IMAP, e.g. `127.0.0.1:143`.
     pub imap: String,
+    /// Inbound MX reception (no-auth SMTP), e.g. `127.0.0.1:25` (`:2525` in dev).
+    pub inbound: String,
 }
 
 /// Bind all listeners and serve connections until Ctrl-C, spawning a task per
@@ -37,23 +45,43 @@ pub async fn run(server: Arc<Server>, listeners: &Listeners) -> std::io::Result<
     let submission = TcpListener::bind(&listeners.submission).await?;
     let pop3 = TcpListener::bind(&listeners.pop3).await?;
     let imap = TcpListener::bind(&listeners.imap).await?;
+    let inbound = TcpListener::bind(&listeners.inbound).await?;
     tracing::info!(
         submission = %listeners.submission,
         pop3 = %listeners.pop3,
         imap = %listeners.imap,
+        inbound = %listeners.inbound,
+        relay = server.relay_context().is_some(),
         "snail-server listening"
     );
+
+    // The relay worker runs only when outbound relay is configured.
+    let shutdown = Arc::new(Notify::new());
+    let worker = server.relay_context().is_some().then(|| {
+        spawn_relay_worker(
+            Arc::clone(&server),
+            Arc::clone(&shutdown),
+            RELAY_WORKER_TICK,
+        )
+    });
 
     loop {
         tokio::select! {
             Ok((stream, _)) = submission.accept() => spawn(serve_submission(stream, Arc::clone(&server))),
             Ok((stream, _)) = pop3.accept() => spawn(serve_pop(stream, Arc::clone(&server))),
             Ok((stream, _)) = imap.accept() => spawn(serve_imap(stream, Arc::clone(&server))),
+            Ok((stream, _)) = inbound.accept() => spawn(serve_inbound(stream, Arc::clone(&server))),
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("shutdown signal received");
                 break;
             }
         }
+    }
+
+    // Stop the relay worker and wait for it to finish its current tick.
+    shutdown.notify_one();
+    if let Some(worker) = worker {
+        let _ = worker.await;
     }
     Ok(())
 }

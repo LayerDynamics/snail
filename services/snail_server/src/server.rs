@@ -2,11 +2,15 @@
 //! the shared mail store, the MTA + delivery agent with the spam `filter`, and
 //! exposes the pieces the access servers (`access`) operate over.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use filter::SpamFilter;
 use identity::{Account, Authenticator};
-use mail::{InboundResult, MailCerts, MailDeliveryAgent, Mailbox, MemoryMailStore, Message, Mta};
+use mail::{
+    Envelope, Headers, InboundResult, MailCerts, MailDeliveryAgent, Mailbox, MemoryMailStore,
+    Message, Mta,
+};
 use network::DnsResolver;
 use security::{Credential, CredentialStore, MemoryCredentialStore};
 
@@ -148,9 +152,23 @@ impl Server {
     }
 
     /// Accept an inbound message: deliver to local recipients (scanned by the
-    /// spam filter), returning any recipients that must be relayed onward.
+    /// spam filter) and, when outbound relay is enabled, queue any remote
+    /// recipients onto the durable spool (grouped per domain, one entry each)
+    /// for the relay worker. Returns the [`InboundResult`] from the MTA.
     pub fn accept_inbound(&self, message: Message) -> InboundResult {
-        self.mta.accept_inbound(message)
+        // Only the relay-enabled path needs the message parts cloned for the
+        // spool; a local-only server avoids the copy entirely.
+        let Some(relay) = self.relay.as_ref() else {
+            return self.mta.accept_inbound(message);
+        };
+        let sender = message.envelope.sender.clone();
+        let headers = message.headers.clone();
+        let body = message.body.clone();
+        let result = self.mta.accept_inbound(message);
+        if !result.relay.is_empty() {
+            enqueue_relay(relay, &sender, &headers, &body, &result.relay);
+        }
+        result
     }
 
     /// Whether `mailbox` is hosted locally.
@@ -160,11 +178,42 @@ impl Server {
     }
 }
 
+/// Group `recipients` by domain and enqueue one spool entry per domain (each a
+/// copy of the message restricted to that domain's recipients) for the relay
+/// worker. One entry per domain keeps each queued message single-MX, so retries
+/// never re-deliver to an already-accepted domain.
+fn enqueue_relay(
+    relay: &RelayContext,
+    sender: &Option<Mailbox>,
+    headers: &Headers,
+    body: &[u8],
+    recipients: &[Mailbox],
+) {
+    let mut by_domain: BTreeMap<String, Vec<Mailbox>> = BTreeMap::new();
+    for rcpt in recipients {
+        by_domain
+            .entry(rcpt.domain.to_ascii_lowercase())
+            .or_default()
+            .push(rcpt.clone());
+    }
+    for (domain, rcpts) in by_domain {
+        let message = Message {
+            envelope: Envelope::new(sender.clone(), rcpts),
+            headers: headers.clone(),
+            body: body.to_vec(),
+        };
+        match relay.spool.enqueue(&message) {
+            Ok(id) => tracing::info!(id = %id, domain = %domain, "queued message for relay"),
+            Err(error) => tracing::error!(domain = %domain, %error, "failed to enqueue relay"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use access::{Pop3Session, PopCommand, PopState};
-    use mail::{DeliveryOutcome, Envelope};
+    use mail::DeliveryOutcome;
 
     fn inbound(from: &str, to: &str, subject: &str, body: &str) -> Message {
         Message::parse(
