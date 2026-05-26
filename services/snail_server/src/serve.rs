@@ -3,6 +3,7 @@
 //!
 //! Framing is UTF-8 line based; binary message bodies are a future enhancement.
 
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -12,6 +13,7 @@ use access::{
     ImapCommand, ImapSession, MsaSession, Pop3Session, PopCommand, PopReply, TaggedCommand,
 };
 use mail::{InboundCollector, SmtpCommand, SmtpSession};
+use security::Decision;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
@@ -70,7 +72,7 @@ pub async fn run(server: Arc<Server>, listeners: &Listeners) -> std::io::Result<
             Ok((stream, _)) = submission.accept() => spawn(serve_submission(stream, Arc::clone(&server))),
             Ok((stream, _)) = pop3.accept() => spawn(serve_pop(stream, Arc::clone(&server))),
             Ok((stream, _)) = imap.accept() => spawn(serve_imap(stream, Arc::clone(&server))),
-            Ok((stream, _)) = inbound.accept() => spawn(serve_inbound(stream, Arc::clone(&server))),
+            Ok((stream, peer)) = inbound.accept() => spawn(serve_inbound_firewalled(stream, peer, Arc::clone(&server))),
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("shutdown signal received");
                 break;
@@ -92,6 +94,28 @@ fn spawn(fut: impl std::future::Future<Output = std::io::Result<()>> + Send + 's
             tracing::warn!(%error, "connection handler ended with error");
         }
     });
+}
+
+/// Firewall-gated entry to the public inbound port: rate-limited or blocklisted
+/// peers get `421` and are dropped before any mail transaction; everyone else
+/// is handed to [`serve_inbound`].
+///
+/// # Errors
+/// [`std::io::Error`] on socket failure.
+pub async fn serve_inbound_firewalled(
+    stream: TcpStream,
+    peer: SocketAddr,
+    server: Arc<Server>,
+) -> std::io::Result<()> {
+    match server.firewall().check(peer.ip()) {
+        Decision::Allow => serve_inbound(stream, server).await,
+        Decision::Deny(reason) => {
+            tracing::warn!(peer = %peer, ?reason, "inbound connection denied by firewall");
+            let (_read, mut write) = stream.into_split();
+            write.write_all(b"421 Service not available\r\n").await?;
+            Ok(())
+        }
+    }
 }
 
 /// Serve one authenticated-submission (SMTP) connection.
@@ -625,5 +649,56 @@ mod tests {
         tw.write_all(b"QUIT\r\n").await.unwrap();
 
         assert_eq!(server.store().count("bob@example.com"), 1);
+    }
+
+    #[tokio::test]
+    async fn inbound_firewall_rate_limits_a_flood() {
+        use governor::Quota;
+        use security::FirewallConfig;
+        use std::num::NonZeroU32;
+
+        // A tight per-IP burst of 2: the first connections from a peer are
+        // greeted, further rapid ones are refused with 421.
+        let config = FirewallConfig {
+            quota: Quota::per_minute(NonZeroU32::new(2).unwrap()),
+            ..FirewallConfig::default()
+        };
+        let server = Arc::new(
+            Server::new(&ServerConfig::new(["example.com".to_string()])).with_firewall(&config),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        {
+            let srv = Arc::clone(&server);
+            tokio::spawn(async move {
+                loop {
+                    let (stream, peer) = listener.accept().await.unwrap();
+                    let srv = Arc::clone(&srv);
+                    tokio::spawn(async move {
+                        let _ = serve_inbound_firewalled(stream, peer, srv).await;
+                    });
+                }
+            });
+        }
+
+        // All connections originate from the one loopback IP, so after the burst
+        // the firewall answers 421 in place of the 220 greeting.
+        let mut greetings = Vec::new();
+        for _ in 0..6 {
+            let client = TcpStream::connect(addr).await.unwrap();
+            let (cr, _cw) = client.into_split();
+            let mut cr = BufReader::new(cr);
+            greetings.push(read_line(&mut cr).await);
+        }
+        let greeted = greetings.iter().filter(|g| g.starts_with("220")).count();
+        let denied = greetings.iter().filter(|g| g.starts_with("421")).count();
+        assert!(
+            greeted >= 1,
+            "burst should admit the first peers: {greetings:?}"
+        );
+        assert!(
+            denied >= 1,
+            "flood beyond burst must be rate-limited: {greetings:?}"
+        );
     }
 }

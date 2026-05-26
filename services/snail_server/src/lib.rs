@@ -12,7 +12,10 @@ pub mod worker;
 
 pub use config::ServerConfig;
 pub use outbound::{RelayReport, relay, relay_to};
-pub use serve::{Listeners, run, serve_imap, serve_inbound, serve_pop, serve_submission};
+pub use serve::{
+    Listeners, run, serve_imap, serve_inbound, serve_inbound_firewalled, serve_pop,
+    serve_submission,
+};
 pub use server::{RelayContext, Server, ServerAuth, ServerMta, SharedStore};
 pub use spool::{OutboundSpool, SpoolEntry, backoff};
 pub use worker::{relay_due, spawn_relay_worker};

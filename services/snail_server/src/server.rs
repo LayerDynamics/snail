@@ -12,7 +12,7 @@ use mail::{
     Message, Mta,
 };
 use network::DnsResolver;
-use security::{Credential, CredentialStore, MemoryCredentialStore};
+use security::{Credential, CredentialStore, Firewall, FirewallConfig, MemoryCredentialStore};
 
 use crate::config::ServerConfig;
 use crate::spool::OutboundSpool;
@@ -51,6 +51,7 @@ pub struct Server {
     tls: Option<Arc<rustls::ServerConfig>>,
     helo: String,
     relay: Option<RelayContext>,
+    firewall: Arc<Firewall>,
 }
 
 impl Server {
@@ -74,7 +75,22 @@ impl Server {
             tls: None,
             helo,
             relay: None,
+            firewall: Arc::new(Firewall::new(&FirewallConfig::default())),
         }
+    }
+
+    /// Replace the connection firewall (the public inbound port is gated by it).
+    /// Defaults to [`FirewallConfig::default`]; tests use a tight quota.
+    #[must_use]
+    pub fn with_firewall(mut self, config: &FirewallConfig) -> Self {
+        self.firewall = Arc::new(Firewall::new(config));
+        self
+    }
+
+    /// The connection firewall gating inbound (port 25) accepts.
+    #[must_use]
+    pub fn firewall(&self) -> &Firewall {
+        &self.firewall
     }
 
     /// Enable outbound relay: queue remote mail to `spool` and deliver it by
