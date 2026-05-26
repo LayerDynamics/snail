@@ -57,6 +57,12 @@ pub trait CredentialStore: Send + Sync {
     /// Verify a plaintext `password` against the stored hash for `username`.
     /// Returns `Ok(false)` for an unknown user or a wrong password.
     ///
+    /// Implementations **must not** leak account existence through timing: the
+    /// unknown-user path must spend the same work as a real verify by hashing
+    /// against a decoy (see [`crate::encryption::PasswordHasher::verify_dummy`]).
+    /// Returning `Ok(false)` early without hashing reopens an account-enumeration
+    /// oracle.
+    ///
     /// # Errors
     /// [`crate::error::SecurityError::Hash`] if the stored PHC is malformed.
     fn verify_password(&self, username: &str, password: &str) -> Result<bool>;

@@ -1,10 +1,22 @@
 //! Argon2id password hashing.
 
+use std::sync::LazyLock;
+
 use argon2::password_hash::{PasswordHash, PasswordHasher as _, PasswordVerifier};
 
 use crate::encryption::algos::PasswordAlgo;
 use crate::encryption::salt;
 use crate::error::{Result, SecurityError};
+
+/// A fixed Argon2id hash, computed once for the whole process, used only to spend
+/// verification time on authentication miss paths. It uses the default
+/// parameters, so verifying against it costs the same as verifying a real
+/// credential — which is the point (see [`PasswordHasher::verify_dummy`]).
+static DECOY_PHC: LazyLock<String> = LazyLock::new(|| {
+    PasswordHasher::default()
+        .hash("snail-account-enumeration-decoy")
+        .expect("hashing a fixed decoy password with default params cannot fail")
+});
 
 /// Hashes and verifies passwords with the configured algorithm (Argon2id).
 pub struct PasswordHasher {
@@ -32,6 +44,19 @@ impl PasswordHasher {
             .hash_password(password.as_bytes(), &salt)
             .map_err(|e| SecurityError::Hash(e.to_string()))?;
         Ok(hash.to_string())
+    }
+
+    /// Spend a password verification's worth of time without revealing anything:
+    /// verify `password` against a fixed decoy hash and discard the outcome.
+    /// **Always behaves as a failed verification** — it exists purely for its
+    /// timing.
+    ///
+    /// Authentication miss paths (unknown user, disabled account) call this so
+    /// they cost the same wall-clock time as verifying a real credential, which
+    /// closes the account-enumeration timing oracle. The decoy uses the default
+    /// parameters, so the work performed matches a genuine verify.
+    pub fn verify_dummy(&self, password: &str) {
+        let _ = self.verify(password, &DECOY_PHC);
     }
 
     /// Verify `password` against a PHC string. Returns `Ok(false)` on mismatch,
