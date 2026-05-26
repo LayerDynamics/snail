@@ -1,0 +1,15 @@
+[package]
+name = "filter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+mail.workspace = true
+utilities.workspace = true
+telemetry.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

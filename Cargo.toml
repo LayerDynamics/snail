@@ -8,6 +8,7 @@ members = [
     "crates/security",
     "crates/identity",
     "crates/access",
+    "crates/filter",
 ]
 
 [workspace.package]
@@ -57,6 +58,7 @@ security = { path = "crates/security" }
 identity = { path = "crates/identity" }
 mail = { path = "crates/mail" }
 access = { path = "crates/access" }
+filter = { path = "crates/filter" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
