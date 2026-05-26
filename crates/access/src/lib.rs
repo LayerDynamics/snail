@@ -2,11 +2,20 @@
 //! (authenticated submission), web access, and the manager that runs them. Each
 //! authenticates via `identity` and reads/writes the `mail` store.
 
+pub mod dovecot;
 pub mod error;
+pub mod imap;
+pub mod manager;
+pub mod msa;
 pub mod pop;
+pub mod web;
 
 pub use error::{AccessError, Result};
+pub use imap::{FetchItem, ImapCommand, ImapResponse, ImapSession, ImapState, TaggedCommand};
+pub use manager::{AccessConfig, AccessManager};
+pub use msa::MsaSession;
 pub use pop::{Pop3Session, PopCommand, PopReply, PopState};
+pub use web::{WebAccess, WebRequest, WebResponse};
 
 /// Authenticates a username + password for an access session.
 ///
