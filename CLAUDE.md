@@ -10,28 +10,38 @@ There is intentionally **no built-in `@<company>.com`** — a **custom domain is
 
 ## Current state — READ THIS FIRST
 
-The repo is an early scaffold with a **working Rust foundation**. Most of the tree is still empty placeholders, but the base layer compiles, tests, and runs:
+The **entire Rust engine is built, tested, and runs** (milestones m0–m15). The composition root boots and serves mail end-to-end; the TypeScript tooling and the FFI client binding are the only parts still empty.
 
-- **Built, tested, committed:** `crates/utilities` (typed `UtilError` + process `Config`) and `services/telemetry` (a `tracing` + OpenTelemetry pipeline: `init()` → `TelemetryGuard`, plus a `telemetry selftest` binary). `crates/mail` has a wiring-proof `main.rs` that depends on both and emits a traced log. All clippy/fmt-clean.
-- **Still 0-byte empty scaffold (untracked until populated):** every other crate — `crates/{access,client,filter,identity,network,security}` — plus `services/snail_server`, the whole TypeScript side (`packages/`, `apps/`, `pnpm-workspace.yaml`), `plugins/`, and most of `crates/mail`'s submodules (`transport/`, `storage/`, `security/`, `observability/`, `snailmail.rs`).
+- **Built, tested, committed (9 workspace members, ~133 tests, all clippy `-D warnings` + fmt clean):**
+  - `crates/utilities` — typed `UtilError` + process `Config`.
+  - `services/telemetry` — `tracing` + OpenTelemetry pipeline (`init()` → `TelemetryGuard`) + `telemetry selftest` binary.
+  - `crates/network` — async DNS (hickory `DnsResolver`, MX lookup) + rustls/rcgen TLS config (m9).
+  - `crates/security` — argon2 `PasswordHasher`, chacha20poly1305 `SecretCipher`, `CredentialStore`, governor `Firewall`, `AuditLog` (m10).
+  - `crates/identity` — account model, password auth, SASL `PLAIN`/`LOGIN`/`XOAUTH2`, connection state (m11).
+  - `crates/mail` — RFC 5322 message model, `MailStore` + in-memory store, MDA delivery, SMTP parser + server session, inbound DATA collection, outbound relay script, `Mta` local/remote routing, content scanner, STARTTLS policy, mail-flow metrics (m12).
+  - `crates/access` — POP3, IMAP, MSA submission sessions, Dovecot Maildir++ mapping, web access, `AccessManager` (m13).
+  - `crates/filter` — content-based spam scoring implementing `mail::MessageFilter` (m14).
+  - `services/snail_server` — the **composition root**: `Server` wires auth + shared store + `Mta`/filter + access; async TCP listeners for submission/POP3/IMAP with ctrl-C shutdown; `snail-server` binary. Verified e2e (submit→deliver→retrieve) both in-process and over real TCP sockets (m15).
+- **Still empty scaffold (untracked until populated):** `crates/client` (the FFI client binding — `build.rs`, `bind.rs`, `src/main.rs`), the whole TypeScript side (`packages/{cli,sdk}`, `apps/{desktop-client,web-client}`, `pnpm-workspace.yaml`), and `plugins/`.
 
 What this means for working here:
 
-- In the **empty** areas, the default task is to *populate* a placeholder, not edit existing logic — a Grep for a symbol there finds nothing yet, and the directory/file names are the design spec.
-- The build is **real** — see commands below. A new crate joins `[workspace.members]` in the root `Cargo.toml` only once it compiles; keep the workspace green at every step.
-- Implementation followed the plan at `docs/plans/2026-05-25-foundation-utilities-telemetry.md` (milestones m0–m8).
+- In the **empty** areas (TS + `crates/client`), the default task is to *populate* a placeholder, not edit existing logic — a Grep for a symbol there finds nothing yet, and the directory/file names are the design spec.
+- The build is **real** — see commands below. A crate joins `[workspace.members]` in the root `Cargo.toml` only once it compiles; keep the workspace green at every step.
+- Implementation followed two plans: `docs/plans/2026-05-25-foundation-utilities-telemetry.md` (m0–m8) and `docs/plans/2026-05-25-engine-phase-roadmap-m9-m15.md` (m9–m15).
+- **The one known engine gap toward a full internet MTA:** outbound relay to remote MX and inbound MX reception on port 25 are *not yet wired into the running server*. The building blocks exist and are tested — `network` resolves MX, and `mail`'s `relay_script` builds the client SMTP dialog — but `serve_submission` currently delivers locally and does not yet drive a TCP relay for remote recipients, and there is no no-auth port-25 receiver. This is the natural next step.
 
 ## Build, test, lint (Rust workspace)
 
 A Cargo workspace (edition 2024, resolver `"3"`) defined by the root `Cargo.toml`. Shared dependency versions and lint rules live in `[workspace.dependencies]` / `[workspace.lints]`; each member inherits via `[lints] workspace = true` and `<dep>.workspace = true`.
 
-- Build / test everything: `cargo build` · `cargo test`
-- One crate: `cargo test -p utilities` (or `-p telemetry`)
+- Build / test everything: `cargo build --workspace` · `cargo test --workspace`
+- One crate: `cargo test -p mail` (any of `utilities telemetry network security identity mail access filter snail_server`)
 - A single test by name: `cargo test -p telemetry parse_otlp_extracts_endpoint`
 - Lint gate (must be clean): `cargo clippy --workspace --all-targets -- -D warnings`
 - Format: `cargo fmt --check` (verify) · `cargo fmt` (apply)
 - Run the telemetry self-test: `cargo run -p telemetry -- selftest`
-- Run the mail wiring proof: `cargo run -p mail`
+- **Run the mail server:** `cargo run -p snail_server --bin snail-server`. Configured via env: `SNAIL_DOMAIN` (local domain), `SNAIL_USERS` (`user:pass,user2:pass2` to provision at boot), `SNAIL_SUBMISSION_ADDR`/`SNAIL_POP3_ADDR`/`SNAIL_IMAP_ADDR` (bind addrs, default `127.0.0.1:587`/`:110`/`:143`), plus `SNAIL_DATA_DIR`/`SNAIL_LOG`. Logs structured JSON; ctrl-C for graceful shutdown.
 
 **Error-handling convention:** `thiserror` typed errors in **library** crates, `anyhow` in **binaries** (typed errors convert via `?`). The TypeScript workspace (pnpm) is not set up yet.
 
@@ -46,13 +56,13 @@ The base layer; every other crate depends on them. Both are independent of each 
 
 ### Rust engine
 
-- **Mail core — `crates/mail/`**: the heart of the server. *Currently only a wiring-proof `src/main.rs` (depends on the foundation, emits one traced log); the submodules below are empty scaffold awaiting their own plan.*
-  - `transport/` — `mta.rs`, `smtp.rs`, `inbound.rs`, `outbound.rs` (mail transfer agent and SMTP send/receive paths)
-  - `storage/` — `mda.rs` (mail delivery agent), `store.rs` (mailbox persistence)
-  - `security/` — `certs.rs`, `tls.rs`, `scanner.rs` (message scanning)
-  - `observability/`, plus `snailmail.rs`
-- **Client access protocols — `crates/access/`**: how mail clients talk to the server — `imap.rs`, `pop.rs`, `msa.rs` (mail submission agent), `dovecot.rs`, `web.rs`, coordinated by `manager.rs`.
-- **Identity / auth — `crates/identity/`**: `auth.rs`, `oauth.rs`, `sals.rs` (**likely SASL**), `connect.rs`, `check.rs`, `data.rs`.
+- **Mail core — `crates/mail/`** (implemented; the heart of the server, a **library** — no `main.rs`):
+  - `transport/` — `mta.rs` (`Mta` local/remote routing), `smtp.rs` (`SmtpCommand` parser + `SmtpSession` state machine), `inbound.rs` (`InboundCollector` DATA accumulation), `outbound.rs` (`relay_script` client dialog)
+  - `storage/` — `mda.rs` (delivery pipeline), `store.rs` (`MailStore` trait + `MemoryMailStore`; `impl MailStore for Arc<T>` so the store is shared between MTA and access servers)
+  - `security/` — `certs.rs`, `tls.rs` (STARTTLS policy), `scanner.rs` (content scanner implementing `MessageFilter`)
+  - `observability/` — mail-flow metrics; plus the message model in `snailmail.rs`
+- **Client access protocols — `crates/access/`** (implemented): how mail clients talk to the server — `imap.rs`, `pop.rs`, `msa.rs` (mail submission agent), `dovecot.rs` (Maildir++ mapping), `web.rs`, coordinated by `manager.rs` (`AccessManager`).
+- **Identity / auth — `crates/identity/`** (implemented): `auth.rs`, `oauth.rs` (XOAUTH2), `sals.rs` (**SASL** — `PLAIN`/`LOGIN`), `connect.rs`, `check.rs`, `data.rs`.
 - **Security — `crates/security/`**: `encryption/` (`encrypt`, `decrypt`, `salt`, `hash`, `algos/`), `credential/` (`provider`, `manager`, `reciever.rs`), `firewall/` (`allow`, `block`, `track`, `trace`, `pause`), and `audit/` (`audit_logger.rs`). Identity is **not** here — it lives solely in the `crates/identity/` crate.
 - **Deliverability — `crates/network/`**: `dns/` with `mx.rs`, `a.rs`, `txt.rs`, `dkim.rs`, `dmark.rs` (**likely DMARC**), `reverse.rs`, `lookup.rs` — the DNS records a mail server needs to be trusted — plus `tls/`.
 - **Spam — `crates/filter/`**: `spam/` filtering.
@@ -60,7 +70,7 @@ The base layer; every other crate depends on them. Both are independent of each 
 
 ### Rust binaries — `services/`
 
-- `snail_server/` — the composition root: the main server binary that wires all crates together and initializes telemetry at startup. *Still empty scaffold — the natural next milestone.*
+- `snail_server/` — the composition root (implemented): `lib.rs` exposes `Server` (wires auth + shared store + `Mta`/filter + access) and `install_crypto_provider()`; `serve.rs` has the async TCP listeners (`run`/`serve_submission`/`serve_pop`/`serve_imap`); `main.rs` is the `snail-server` binary that installs the rustls provider, inits telemetry, provisions users from env, binds the listeners, and runs until ctrl-C.
 - `telemetry/` — its `telemetry selftest` `[[bin]]` lives here, but treat it as a **foundation** crate (see above), not a top-layer consumer. A long-running OTLP collector is deferred.
 
 ### TypeScript side
