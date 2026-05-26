@@ -18,13 +18,16 @@ utilities.workspace = true
 telemetry.workspace = true
 identity.workspace = true
 security.workspace = true
+network.workspace = true
 mail.workspace = true
 filter.workspace = true
 access.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-tokio = { workspace = true, features = ["signal"] }
+tokio = { workspace = true, features = ["signal", "sync", "fs"] }
 rustls.workspace = true
+tokio-rustls.workspace = true
+rcgen.workspace = true
 
 [dev-dependencies]
 base64.workspace = true

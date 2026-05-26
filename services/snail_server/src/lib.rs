@@ -4,10 +4,12 @@
 //! the binary.
 
 pub mod config;
+pub mod outbound;
 pub mod serve;
 pub mod server;
 
 pub use config::ServerConfig;
+pub use outbound::{RelayReport, relay_to};
 pub use serve::{Listeners, run, serve_imap, serve_pop, serve_submission};
 pub use server::{Server, ServerAuth, ServerMta, SharedStore};
 
