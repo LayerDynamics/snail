@@ -51,6 +51,11 @@ impl<'a, A: SessionAuth> MsaSession<'a, A> {
 
     /// Handle an SMTP command. The mail transaction (`MAIL`/`RCPT`/`DATA`) is
     /// refused with `530` until the session has authenticated (submission policy).
+    ///
+    /// Per RFC 6409 the envelope sender is bound to the authenticated identity:
+    /// an authenticated user may only send as themselves, so the server never
+    /// lends its SPF/DKIM reputation to a spoofed `MAIL FROM`. A mismatch — or the
+    /// owner-less null sender `<>` — is refused with `553`.
     pub fn handle(&mut self, command: SmtpCommand) -> SmtpReply {
         let needs_auth = matches!(
             command,
@@ -58,6 +63,17 @@ impl<'a, A: SessionAuth> MsaSession<'a, A> {
         );
         if needs_auth && !self.is_authenticated() {
             return SmtpReply::new(530, "Authentication required");
+        }
+        if let SmtpCommand::MailFrom(sender) = &command
+            && let Some(user) = self.user.as_deref()
+            && !sender
+                .as_ref()
+                .is_some_and(|mailbox| mailbox.to_string().eq_ignore_ascii_case(user))
+        {
+            return SmtpReply::new(
+                553,
+                format!("5.7.1 Sender address rejected: not owned by user {user}"),
+            );
         }
         self.smtp.handle(command)
     }
@@ -124,6 +140,53 @@ mod tests {
             s.handle(SmtpCommand::parse("MAIL FROM:<alice@example.com>").unwrap())
                 .code,
             530
+        );
+    }
+
+    /// Authenticate as alice and identify, ready for a `MAIL FROM`.
+    fn authed_session(auth: &StubAuth) -> MsaSession<'_, StubAuth> {
+        let mut s = MsaSession::new(auth);
+        s.authenticate_plain(&auth_plain("alice@example.com", "pw"));
+        s.handle(SmtpCommand::parse("EHLO me").unwrap());
+        s
+    }
+
+    #[test]
+    fn spoofed_sender_is_rejected_but_own_address_accepted() {
+        let auth = StubAuth;
+        let mut s = authed_session(&auth);
+        // alice cannot send as someone else — no borrowing the server's reputation.
+        assert_eq!(
+            s.handle(SmtpCommand::parse("MAIL FROM:<ceo@victim.org>").unwrap())
+                .code,
+            553
+        );
+        // The rejection leaves the transaction reusable: her own address is fine.
+        assert_eq!(
+            s.handle(SmtpCommand::parse("MAIL FROM:<alice@example.com>").unwrap())
+                .code,
+            250
+        );
+    }
+
+    #[test]
+    fn sender_binding_is_case_insensitive() {
+        let auth = StubAuth;
+        let mut s = authed_session(&auth);
+        assert_eq!(
+            s.handle(SmtpCommand::parse("MAIL FROM:<Alice@Example.COM>").unwrap())
+                .code,
+            250
+        );
+    }
+
+    #[test]
+    fn null_sender_is_rejected_on_submission() {
+        let auth = StubAuth;
+        let mut s = authed_session(&auth);
+        assert_eq!(
+            s.handle(SmtpCommand::parse("MAIL FROM:<>").unwrap()).code,
+            553
         );
     }
 }
