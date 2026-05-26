@@ -1698,6 +1698,7 @@ version = "0.1.0"
 dependencies = [
  "access",
  "anyhow",
+ "async-trait",
  "base64",
  "filter",
  "identity",

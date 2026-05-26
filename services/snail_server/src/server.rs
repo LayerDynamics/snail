@@ -7,9 +7,28 @@ use std::sync::Arc;
 use filter::SpamFilter;
 use identity::{Account, Authenticator};
 use mail::{InboundResult, MailCerts, MailDeliveryAgent, Mailbox, MemoryMailStore, Message, Mta};
+use network::DnsResolver;
 use security::{Credential, CredentialStore, MemoryCredentialStore};
 
 use crate::config::ServerConfig;
+use crate::spool::OutboundSpool;
+
+/// The default SMTP relay port (production MX delivery target).
+pub const DEFAULT_RELAY_PORT: u16 = 25;
+
+/// Everything the relay worker needs to drive outbound delivery: where to look
+/// up MX (`resolver`), the durable queue (`spool`), the EHLO name to announce
+/// (`helo`), and the port to connect to on each exchange (`port`).
+pub struct RelayContext {
+    /// DNS resolver for MX lookups.
+    pub resolver: Arc<dyn DnsResolver>,
+    /// Durable outbound queue.
+    pub spool: Arc<OutboundSpool>,
+    /// The domain announced in the client EHLO.
+    pub helo: String,
+    /// The port to connect to on each mail exchange (`25` in production).
+    pub port: u16,
+}
 
 /// The concrete credential store the server authenticates against.
 pub type ServerAuth = Authenticator<MemoryCredentialStore>;
@@ -26,6 +45,8 @@ pub struct Server {
     store: SharedStore,
     mta: ServerMta,
     tls: Option<Arc<rustls::ServerConfig>>,
+    helo: String,
+    relay: Option<RelayContext>,
 }
 
 impl Server {
@@ -37,12 +58,49 @@ impl Server {
         let mda = MailDeliveryAgent::new(Arc::clone(&store), SpamFilter::new());
         let mta = Mta::new(mda, config.local_domains.clone());
         let auth = Authenticator::new(MemoryCredentialStore::new());
+        let helo = config
+            .local_domains
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "localhost".to_string());
         Self {
             auth,
             store,
             mta,
             tls: None,
+            helo,
+            relay: None,
         }
+    }
+
+    /// Enable outbound relay: queue remote mail to `spool` and deliver it by
+    /// resolving MX via `resolver`. Without this, the server delivers locally
+    /// only. The relay port defaults to [`DEFAULT_RELAY_PORT`]; override it with
+    /// [`Server::with_relay_port`] (tests point it at a loopback receiver).
+    #[must_use]
+    pub fn with_relay(mut self, resolver: Arc<dyn DnsResolver>, spool: Arc<OutboundSpool>) -> Self {
+        self.relay = Some(RelayContext {
+            resolver,
+            spool,
+            helo: self.helo.clone(),
+            port: DEFAULT_RELAY_PORT,
+        });
+        self
+    }
+
+    /// Override the relay connection port (no-op if relay is not enabled).
+    #[must_use]
+    pub fn with_relay_port(mut self, port: u16) -> Self {
+        if let Some(relay) = self.relay.as_mut() {
+            relay.port = port;
+        }
+        self
+    }
+
+    /// The relay context, if outbound relay is enabled.
+    #[must_use]
+    pub fn relay_context(&self) -> Option<&RelayContext> {
+        self.relay.as_ref()
     }
 
     /// Enable STARTTLS on the inbound receiver, building the rustls server config

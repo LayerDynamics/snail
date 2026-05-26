@@ -6,6 +6,7 @@
 
 use mail::Message;
 use mail::transport::relay_script;
+use network::{DnsResolver, MxRecord};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
@@ -136,6 +137,72 @@ pub async fn relay_to(addr: &str, helo: &str, message: &Message) -> std::io::Res
     } else {
         Ok(classify(code, &text.join(" ")))
     }
+}
+
+/// Relay `message` to its recipients' domain by resolving MX records via
+/// `resolver` and trying each exchange (lowest preference first) at `port`
+/// (`25` in production). The message is expected to be single-domain — the
+/// spool enqueues one entry per recipient domain — so the first recipient's
+/// domain drives the lookup.
+///
+/// A domain with no MX falls back to its A/AAAA record as an implicit MX
+/// (RFC 5321 §5.1). The first exchange to deliver wins; a permanent (`5xx`)
+/// rejection stops immediately; otherwise the last transient outcome is
+/// returned so the caller can retry.
+pub async fn relay(
+    resolver: &dyn DnsResolver,
+    helo: &str,
+    port: u16,
+    message: &Message,
+) -> RelayReport {
+    let Some(domain) = message
+        .envelope
+        .recipients
+        .first()
+        .map(|m| m.domain.clone())
+    else {
+        return RelayReport::Failed {
+            reason: "message has no recipients".to_string(),
+        };
+    };
+
+    let exchanges = match resolver.lookup_mx(&domain).await {
+        Ok(mut mxs) if !mxs.is_empty() => {
+            mxs.sort_by_key(|mx| mx.preference);
+            mxs
+        }
+        // No MX record: the domain's own A/AAAA is the implicit mail exchange.
+        Ok(_) => vec![MxRecord {
+            preference: 0,
+            exchange: domain.clone(),
+        }],
+        Err(error) => {
+            return RelayReport::Deferred {
+                code: 0,
+                text: format!("MX lookup for {domain}: {error}"),
+            };
+        }
+    };
+
+    let mut last = RelayReport::Deferred {
+        code: 0,
+        text: format!("no usable MX for {domain}"),
+    };
+    for mx in &exchanges {
+        let addr = format!("{}:{}", mx.exchange, port);
+        match relay_to(&addr, helo, message).await {
+            Ok(RelayReport::Delivered) => return RelayReport::Delivered,
+            Ok(failed @ RelayReport::Failed { .. }) => return failed, // permanent; stop
+            Ok(deferred) => last = deferred,                          // try the next MX
+            Err(error) => {
+                last = RelayReport::Deferred {
+                    code: 0,
+                    text: format!("{addr}: {error}"),
+                };
+            }
+        }
+    }
+    last
 }
 
 #[cfg(test)]
