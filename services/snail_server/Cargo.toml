@@ -1,0 +1,23 @@
+[package]
+name = "snail_server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "snail_server"
+path = "src/lib.rs"
+
+[dependencies]
+utilities.workspace = true
+identity.workspace = true
+security.workspace = true
+mail.workspace = true
+filter.workspace = true
+access.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

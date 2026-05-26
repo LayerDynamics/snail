@@ -9,6 +9,7 @@ members = [
     "crates/identity",
     "crates/access",
     "crates/filter",
+    "services/snail_server",
 ]
 
 [workspace.package]
