@@ -8,7 +8,7 @@ use std::sync::Arc;
 use access::{
     ImapCommand, ImapSession, MsaSession, Pop3Session, PopCommand, PopReply, TaggedCommand,
 };
-use mail::{InboundCollector, SmtpCommand};
+use mail::{InboundCollector, SmtpCommand, SmtpSession};
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -115,6 +115,73 @@ pub async fn serve_submission(stream: TcpStream, server: Arc<Server>) -> std::io
                 write
                     .write_all(format!("{} {}\r\n", reply.code, reply.text).as_bytes())
                     .await?;
+                if reply.code == 354 {
+                    collecting = Some(InboundCollector::new());
+                }
+                if is_quit {
+                    break;
+                }
+            }
+            Err(error) => {
+                write
+                    .write_all(format!("500 {error}\r\n").as_bytes())
+                    .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Serve one inbound MX connection: a no-auth SMTP *receiver* on the public
+/// port. Accepts mail from external senders to **local** recipients only — a
+/// `RCPT` to a non-local mailbox is refused (`550`) so Snail is never an open
+/// relay. STARTTLS is layered on in a later step.
+///
+/// # Errors
+/// [`std::io::Error`] on socket failure.
+pub async fn serve_inbound(stream: TcpStream, server: Arc<Server>) -> std::io::Result<()> {
+    let (read, mut write) = stream.into_split();
+    let mut lines = BufReader::new(read).lines();
+    let mut session = SmtpSession::new();
+    let mut collecting: Option<InboundCollector> = None;
+
+    write.write_all(b"220 Snail ESMTP ready\r\n").await?;
+    while let Some(line) = lines.next_line().await? {
+        // DATA body mode: accumulate until the lone "." line, then deliver.
+        if let Some(collector) = collecting.as_mut() {
+            if collector.push_line(&line) {
+                let collector = collecting.take().expect("collecting was Some");
+                let reply = match session.take_envelope() {
+                    Some(envelope) => match collector.into_message(envelope) {
+                        Ok(message) => {
+                            // Recipients were vetted as local at RCPT time, so this
+                            // delivers locally and never relays.
+                            let _ = server.accept_inbound(message);
+                            "250 OK message accepted\r\n"
+                        }
+                        Err(_) => "554 message parse error\r\n",
+                    },
+                    None => "554 no valid recipients\r\n",
+                };
+                write.write_all(reply.as_bytes()).await?;
+            }
+            continue;
+        }
+
+        match SmtpCommand::parse(&line) {
+            Ok(command) => {
+                // No open relay: refuse RCPT to recipients we do not host.
+                if let SmtpCommand::RcptTo(rcpt) = &command
+                    && !server.is_local(rcpt)
+                {
+                    write
+                        .write_all(format!("550 <{rcpt}> relay not permitted\r\n").as_bytes())
+                        .await?;
+                    continue;
+                }
+                let is_quit = matches!(command, SmtpCommand::Quit);
+                let reply = session.handle(command);
+                write.write_all(reply.to_wire().as_bytes()).await?;
                 if reply.code == 354 {
                     collecting = Some(InboundCollector::new());
                 }
@@ -252,6 +319,7 @@ mod tests {
     use crate::config::ServerConfig;
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
+    use mail::MailStore;
 
     /// Read a single CRLF-terminated line from the client side.
     async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(r: &mut R) -> String {
@@ -334,5 +402,47 @@ mod tests {
         assert!(body.contains("hello over tcp"));
         cw.write_all(b"QUIT\r\n").await.unwrap();
         let _ = cw.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tcp_inbound_delivers_local_and_refuses_relay() {
+        // example.com is hosted here; elsewhere.org is not.
+        let server = Arc::new(Server::new(&ServerConfig::new(["example.com".to_string()])));
+        let inbound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = inbound.local_addr().unwrap();
+        {
+            let srv = Arc::clone(&server);
+            tokio::spawn(async move {
+                let (s, _) = inbound.accept().await.unwrap();
+                serve_inbound(s, srv).await.unwrap();
+            });
+        }
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (cr, mut cw) = client.into_split();
+        let mut cr = BufReader::new(cr);
+        assert!(read_line(&mut cr).await.starts_with("220"));
+
+        // An external sender delivers to a local recipient; an open-relay attempt
+        // to a non-local recipient in the same session is refused (550).
+        for (cmd, expect) in [
+            ("EHLO mx.remote.net", "250"),
+            ("MAIL FROM:<alice@remote.net>", "250"),
+            ("RCPT TO:<bob@example.com>", "250"),
+            ("RCPT TO:<eve@elsewhere.org>", "550"),
+            ("DATA", "354"),
+        ] {
+            cw.write_all(format!("{cmd}\r\n").as_bytes()).await.unwrap();
+            assert!(read_line(&mut cr).await.starts_with(expect), "cmd {cmd}");
+        }
+        cw.write_all(b"Subject: external\r\n\r\nhi bob\r\n.\r\n")
+            .await
+            .unwrap();
+        assert!(read_line(&mut cr).await.starts_with("250")); // accepted
+        cw.write_all(b"QUIT\r\n").await.unwrap();
+
+        // bob (local) received the mail; eve (relay-refused) did not.
+        assert_eq!(server.store().count("bob@example.com"), 1);
+        assert_eq!(server.store().count("eve@elsewhere.org"), 0);
     }
 }
