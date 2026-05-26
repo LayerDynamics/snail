@@ -3,14 +3,17 @@
 //!
 //! Framing is UTF-8 line based; binary message bodies are a future enhancement.
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use access::{
     ImapCommand, ImapSession, MsaSession, Pop3Session, PopCommand, PopReply, TaggedCommand,
 };
 use mail::{InboundCollector, SmtpCommand, SmtpSession};
-use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::server::TlsStream;
 
 use crate::server::Server;
 
@@ -135,18 +138,25 @@ pub async fn serve_submission(stream: TcpStream, server: Arc<Server>) -> std::io
 /// Serve one inbound MX connection: a no-auth SMTP *receiver* on the public
 /// port. Accepts mail from external senders to **local** recipients only — a
 /// `RCPT` to a non-local mailbox is refused (`550`) so Snail is never an open
-/// relay. STARTTLS is layered on in a later step.
+/// relay. When the server has TLS configured, `STARTTLS` is advertised in EHLO
+/// and upgrades the connection before the mail transaction.
 ///
 /// # Errors
-/// [`std::io::Error`] on socket failure.
+/// [`std::io::Error`] on socket failure or a failed TLS handshake.
 pub async fn serve_inbound(stream: TcpStream, server: Arc<Server>) -> std::io::Result<()> {
-    let (read, mut write) = stream.into_split();
-    let mut lines = BufReader::new(read).lines();
+    let tls = server.tls_config();
+    let mut conn = BufReader::new(SmtpStream::Plain(stream));
     let mut session = SmtpSession::new();
     let mut collecting: Option<InboundCollector> = None;
 
-    write.write_all(b"220 Snail ESMTP ready\r\n").await?;
-    while let Some(line) = lines.next_line().await? {
+    conn.write_all(b"220 Snail ESMTP ready\r\n").await?;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if conn.read_line(&mut line).await? == 0 {
+            break;
+        }
+
         // DATA body mode: accumulate until the lone "." line, then deliver.
         if let Some(collector) = collecting.as_mut() {
             if collector.push_line(&line) {
@@ -163,25 +173,59 @@ pub async fn serve_inbound(stream: TcpStream, server: Arc<Server>) -> std::io::R
                     },
                     None => "554 no valid recipients\r\n",
                 };
-                write.write_all(reply.as_bytes()).await?;
+                conn.write_all(reply.as_bytes()).await?;
+            }
+            continue;
+        }
+
+        // STARTTLS: upgrade the socket, then reset the session (the client must
+        // re-issue EHLO over the encrypted channel, per RFC 3207).
+        if line.trim_end().eq_ignore_ascii_case("STARTTLS") {
+            match &tls {
+                Some(config) if matches!(conn.get_ref(), SmtpStream::Plain(_)) => {
+                    if !conn.buffer().is_empty() {
+                        conn.write_all(b"503 no pipelining before STARTTLS\r\n")
+                            .await?;
+                        continue;
+                    }
+                    conn.write_all(b"220 Ready to start TLS\r\n").await?;
+                    let SmtpStream::Plain(tcp) = conn.into_inner() else {
+                        unreachable!("guarded as Plain above")
+                    };
+                    let upgraded = network::tls::accept(Arc::clone(config), tcp)
+                        .await
+                        .map_err(std::io::Error::other)?;
+                    conn = BufReader::new(SmtpStream::Tls(Box::new(upgraded)));
+                    session = SmtpSession::new();
+                }
+                _ => {
+                    conn.write_all(b"502 STARTTLS not available\r\n").await?;
+                }
             }
             continue;
         }
 
         match SmtpCommand::parse(&line) {
-            Ok(command) => {
-                // No open relay: refuse RCPT to recipients we do not host.
-                if let SmtpCommand::RcptTo(rcpt) = &command
-                    && !server.is_local(rcpt)
-                {
-                    write
-                        .write_all(format!("550 <{rcpt}> relay not permitted\r\n").as_bytes())
+            // EHLO/HELO: advertise STARTTLS as a multiline reply while still in
+            // plaintext with TLS available; otherwise a plain greeting.
+            Ok(command @ (SmtpCommand::Ehlo(_) | SmtpCommand::Helo(_))) => {
+                let reply = session.handle(command);
+                if tls.is_some() && matches!(conn.get_ref(), SmtpStream::Plain(_)) {
+                    conn.write_all(format!("250-{}\r\n250 STARTTLS\r\n", reply.text).as_bytes())
                         .await?;
-                    continue;
+                } else {
+                    conn.write_all(reply.to_wire().as_bytes()).await?;
                 }
+            }
+            // No open relay: refuse RCPT to recipients we do not host.
+            Ok(SmtpCommand::RcptTo(rcpt)) if !server.is_local(&rcpt) => {
+                conn.write_all(format!("550 <{rcpt}> relay not permitted\r\n").as_bytes())
+                    .await?;
+            }
+            Ok(command) => {
                 let is_quit = matches!(command, SmtpCommand::Quit);
                 let reply = session.handle(command);
-                write.write_all(reply.to_wire().as_bytes()).await?;
+                conn.write_all(reply.to_wire().as_bytes()).await?;
                 if reply.code == 354 {
                     collecting = Some(InboundCollector::new());
                 }
@@ -190,13 +234,62 @@ pub async fn serve_inbound(stream: TcpStream, server: Arc<Server>) -> std::io::R
                 }
             }
             Err(error) => {
-                write
-                    .write_all(format!("500 {error}\r\n").as_bytes())
+                conn.write_all(format!("500 {error}\r\n").as_bytes())
                     .await?;
             }
         }
     }
     Ok(())
+}
+
+/// A receiver-side stream that may be upgraded from plaintext to TLS mid-session
+/// by `STARTTLS`. Both variants are `Unpin`, so the delegating poll impls need
+/// no `pin-project`.
+pub enum SmtpStream {
+    /// Plaintext TCP (before STARTTLS).
+    Plain(TcpStream),
+    /// TLS, after a successful STARTTLS upgrade.
+    Tls(Box<TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for SmtpStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            SmtpStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            SmtpStream::Tls(s) => Pin::new(&mut **s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for SmtpStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            SmtpStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            SmtpStream::Tls(s) => Pin::new(&mut **s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            SmtpStream::Plain(s) => Pin::new(s).poll_flush(cx),
+            SmtpStream::Tls(s) => Pin::new(&mut **s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            SmtpStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            SmtpStream::Tls(s) => Pin::new(&mut **s).poll_shutdown(cx),
+        }
+    }
 }
 
 /// Serve one POP3 connection.
@@ -444,5 +537,65 @@ mod tests {
         // bob (local) received the mail; eve (relay-refused) did not.
         assert_eq!(server.store().count("bob@example.com"), 1);
         assert_eq!(server.store().count("eve@elsewhere.org"), 0);
+    }
+
+    #[tokio::test]
+    async fn tcp_inbound_starttls_then_deliver() {
+        // Self-signed cert for `localhost`; enable STARTTLS on the receiver.
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_pem = ck.cert.pem();
+        let certs = mail::MailCerts::new(cert_pem.clone(), ck.key_pair.serialize_pem()).unwrap();
+        let server = Arc::new(
+            Server::new(&ServerConfig::new(["example.com".to_string()]))
+                .with_tls(&certs)
+                .unwrap(),
+        );
+        let inbound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = inbound.local_addr().unwrap();
+        {
+            let srv = Arc::clone(&server);
+            tokio::spawn(async move {
+                let (s, _) = inbound.accept().await.unwrap();
+                serve_inbound(s, srv).await.unwrap();
+            });
+        }
+
+        // Plaintext: greeting, then EHLO advertises STARTTLS as a multiline reply.
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let (r, mut w) = tcp.into_split();
+        let mut r = BufReader::new(r);
+        assert!(read_line(&mut r).await.starts_with("220"));
+        w.write_all(b"EHLO client\r\n").await.unwrap();
+        assert!(read_line(&mut r).await.starts_with("250-")); // continuation line
+        assert!(read_line(&mut r).await.contains("STARTTLS")); // final capability
+        w.write_all(b"STARTTLS\r\n").await.unwrap();
+        assert!(read_line(&mut r).await.starts_with("220")); // ready to start TLS
+
+        // Upgrade the client side: rejoin the split halves and handshake.
+        let tcp = r.into_inner().reunite(w).unwrap();
+        let client_config = network::TlsConfig::client_trusting_pem(&cert_pem).unwrap();
+        let tls = network::tls::connect(client_config, "localhost", tcp)
+            .await
+            .unwrap();
+        let (tr, mut tw) = tokio::io::split(tls);
+        let mut tr = BufReader::new(tr);
+
+        // Re-EHLO and run the full transaction over the encrypted channel.
+        for (cmd, expect) in [
+            ("EHLO client", "250"),
+            ("MAIL FROM:<alice@remote.net>", "250"),
+            ("RCPT TO:<bob@example.com>", "250"),
+            ("DATA", "354"),
+        ] {
+            tw.write_all(format!("{cmd}\r\n").as_bytes()).await.unwrap();
+            assert!(read_line(&mut tr).await.starts_with(expect), "cmd {cmd}");
+        }
+        tw.write_all(b"Subject: secure\r\n\r\nover tls\r\n.\r\n")
+            .await
+            .unwrap();
+        assert!(read_line(&mut tr).await.starts_with("250")); // accepted over TLS
+        tw.write_all(b"QUIT\r\n").await.unwrap();
+
+        assert_eq!(server.store().count("bob@example.com"), 1);
     }
 }

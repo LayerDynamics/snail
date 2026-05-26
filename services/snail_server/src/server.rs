@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use filter::SpamFilter;
 use identity::{Account, Authenticator};
-use mail::{InboundResult, MailDeliveryAgent, Mailbox, MemoryMailStore, Message, Mta};
+use mail::{InboundResult, MailCerts, MailDeliveryAgent, Mailbox, MemoryMailStore, Message, Mta};
 use security::{Credential, CredentialStore, MemoryCredentialStore};
 
 use crate::config::ServerConfig;
@@ -25,6 +25,7 @@ pub struct Server {
     auth: ServerAuth,
     store: SharedStore,
     mta: ServerMta,
+    tls: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl Server {
@@ -36,7 +37,31 @@ impl Server {
         let mda = MailDeliveryAgent::new(Arc::clone(&store), SpamFilter::new());
         let mta = Mta::new(mda, config.local_domains.clone());
         let auth = Authenticator::new(MemoryCredentialStore::new());
-        Self { auth, store, mta }
+        Self {
+            auth,
+            store,
+            mta,
+            tls: None,
+        }
+    }
+
+    /// Enable STARTTLS on the inbound receiver, building the rustls server config
+    /// from the given PEM certificate material.
+    ///
+    /// # Errors
+    /// Propagates a TLS-config build error (malformed PEM / missing key).
+    pub fn with_tls(mut self, certs: &MailCerts) -> anyhow::Result<Self> {
+        self.tls = Some(network::TlsConfig::server_from_pem(
+            &certs.cert_pem,
+            &certs.key_pem,
+        )?);
+        Ok(self)
+    }
+
+    /// The STARTTLS server config, if TLS is enabled.
+    #[must_use]
+    pub fn tls_config(&self) -> Option<Arc<rustls::ServerConfig>> {
+        self.tls.clone()
     }
 
     /// Register a user: store their hashed password and create their account so
