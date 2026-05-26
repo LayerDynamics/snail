@@ -9,8 +9,13 @@ publish = false
 name = "snail_server"
 path = "src/lib.rs"
 
+[[bin]]
+name = "snail-server"
+path = "src/main.rs"
+
 [dependencies]
 utilities.workspace = true
+telemetry.workspace = true
 identity.workspace = true
 security.workspace = true
 mail.workspace = true
@@ -18,6 +23,11 @@ filter.workspace = true
 access.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+rustls.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
 
 [lints]
 workspace = true
