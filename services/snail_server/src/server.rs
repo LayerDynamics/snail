@@ -22,7 +22,9 @@ pub const DEFAULT_RELAY_PORT: u16 = 25;
 
 /// Everything the relay worker needs to drive outbound delivery: where to look
 /// up MX (`resolver`), the durable queue (`spool`), the EHLO name to announce
-/// (`helo`), and the port to connect to on each exchange (`port`).
+/// (`helo`), the port to connect to on each exchange (`port`), and the client
+/// TLS config used to opportunistically upgrade each delivery to STARTTLS
+/// (`tls`).
 pub struct RelayContext {
     /// DNS resolver for MX lookups.
     pub resolver: Arc<dyn DnsResolver>,
@@ -32,6 +34,9 @@ pub struct RelayContext {
     pub helo: String,
     /// The port to connect to on each mail exchange (`25` in production).
     pub port: u16,
+    /// Opportunistic-STARTTLS client config; `None` disables outbound TLS (the
+    /// relay then only encrypts if this can be built — see [`Server::with_relay`]).
+    pub tls: Option<Arc<rustls::ClientConfig>>,
 }
 
 /// The concrete credential store the server authenticates against.
@@ -97,13 +102,26 @@ impl Server {
     /// resolving MX via `resolver`. Without this, the server delivers locally
     /// only. The relay port defaults to [`DEFAULT_RELAY_PORT`]; override it with
     /// [`Server::with_relay_port`] (tests point it at a loopback receiver).
+    ///
+    /// Outbound deliveries opportunistically upgrade to STARTTLS using a client
+    /// TLS config built here. If that config cannot be built (no usable crypto
+    /// provider), relay still runs but in cleartext — the build never fails the
+    /// server.
     #[must_use]
     pub fn with_relay(mut self, resolver: Arc<dyn DnsResolver>, spool: Arc<OutboundSpool>) -> Self {
+        let tls = match network::TlsConfig::opportunistic_client() {
+            Ok(config) => Some(config),
+            Err(error) => {
+                tracing::warn!(%error, "outbound STARTTLS disabled; relaying in cleartext");
+                None
+            }
+        };
         self.relay = Some(RelayContext {
             resolver,
             spool,
             helo: self.helo.clone(),
             port: DEFAULT_RELAY_PORT,
+            tls,
         });
         self
     }

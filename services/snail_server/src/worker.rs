@@ -39,7 +39,15 @@ pub async fn relay_due(server: &Server) {
                 continue;
             }
         };
-        match relay(ctx.resolver.as_ref(), &ctx.helo, ctx.port, &message).await {
+        match relay(
+            ctx.resolver.as_ref(),
+            &ctx.helo,
+            ctx.port,
+            &message,
+            ctx.tls.as_ref(),
+        )
+        .await
+        {
             RelayReport::Delivered => {
                 tracing::info!(id = %entry.id, "relayed to remote MX");
                 let _ = ctx.spool.remove(&entry.id);
