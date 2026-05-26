@@ -4,7 +4,7 @@
 //! Maildir/DB store can replace it behind the trait without touching callers.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::snailmail::Message;
 
@@ -27,6 +27,23 @@ pub trait MailStore: Send + Sync {
     fn count(&self, mailbox: &str) -> usize;
     /// Remove the message with `id` from `mailbox`; returns whether it existed.
     fn remove(&self, mailbox: &str, id: u64) -> bool;
+}
+
+/// `Arc<Store>` is itself a [`MailStore`], so a single store can be shared
+/// (by clone) between the delivery agent and the access servers.
+impl<T: MailStore + ?Sized> MailStore for Arc<T> {
+    fn deliver(&self, mailbox: &str, message: Message) -> u64 {
+        (**self).deliver(mailbox, message)
+    }
+    fn list(&self, mailbox: &str) -> Vec<StoredMessage> {
+        (**self).list(mailbox)
+    }
+    fn count(&self, mailbox: &str) -> usize {
+        (**self).count(mailbox)
+    }
+    fn remove(&self, mailbox: &str, id: u64) -> bool {
+        (**self).remove(mailbox, id)
+    }
 }
 
 #[derive(Debug, Default)]
