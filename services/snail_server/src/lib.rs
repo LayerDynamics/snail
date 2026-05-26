@@ -7,11 +7,13 @@ pub mod config;
 pub mod outbound;
 pub mod serve;
 pub mod server;
+pub mod spool;
 
 pub use config::ServerConfig;
 pub use outbound::{RelayReport, relay_to};
 pub use serve::{Listeners, run, serve_imap, serve_inbound, serve_pop, serve_submission};
 pub use server::{Server, ServerAuth, ServerMta, SharedStore};
+pub use spool::{OutboundSpool, SpoolEntry, backoff};
 
 /// Install the process-wide rustls crypto provider (aws-lc-rs). Call once at
 /// startup, before any TLS configuration is built — this is the m9 carryover:
