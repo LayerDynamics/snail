@@ -11,6 +11,10 @@ use crate::SessionAuth;
 /// A parsed POP3 command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PopCommand {
+    /// `CAPA` — capability listing (RFC 2449).
+    Capa,
+    /// `STLS` — begin a TLS upgrade (RFC 2595).
+    Stls,
     /// `USER <name>`
     User(String),
     /// `PASS <password>`
@@ -48,6 +52,8 @@ impl PopCommand {
                 .map_err(|_| format!("invalid message number `{arg}`"))
         };
         match verb.to_ascii_uppercase().as_str() {
+            "CAPA" => Ok(Self::Capa),
+            "STLS" => Ok(Self::Stls),
             "USER" if !arg.is_empty() => Ok(Self::User(arg.to_string())),
             "PASS" => Ok(Self::Pass(arg.to_string())),
             "STAT" => Ok(Self::Stat),
@@ -112,10 +118,15 @@ pub struct Pop3Session<'a, A: SessionAuth, S: MailStore> {
     mailbox: Option<String>,
     messages: Vec<StoredMessage>,
     deleted: HashSet<u64>,
+    /// The server offers `STLS` (a certificate is configured).
+    tls_available: bool,
+    /// The connection is already encrypted (an `STLS` upgrade completed).
+    tls_active: bool,
 }
 
 impl<'a, A: SessionAuth, S: MailStore> Pop3Session<'a, A, S> {
-    /// Start a session in the authorization phase.
+    /// Start a session with no TLS offered (a plaintext-only listener — used when
+    /// the server has no certificate configured).
     pub fn new(auth: &'a A, store: &'a S) -> Self {
         Self {
             auth,
@@ -125,6 +136,27 @@ impl<'a, A: SessionAuth, S: MailStore> Pop3Session<'a, A, S> {
             mailbox: None,
             messages: Vec::new(),
             deleted: HashSet::new(),
+            tls_available: false,
+            tls_active: false,
+        }
+    }
+
+    /// Start a TLS-capable session. `active` is `true` when the connection is
+    /// already encrypted (the session that resumes after an `STLS` upgrade);
+    /// `false` for the initial plaintext phase that advertises and permits
+    /// `STLS`. While TLS is available but not yet active the session refuses
+    /// `USER`/`PASS`, so credentials are never accepted in cleartext.
+    pub fn with_tls(auth: &'a A, store: &'a S, active: bool) -> Self {
+        Self {
+            auth,
+            store,
+            state: PopState::Authorization,
+            pending_user: None,
+            mailbox: None,
+            messages: Vec::new(),
+            deleted: HashSet::new(),
+            tls_available: true,
+            tls_active: active,
         }
     }
 
@@ -167,11 +199,43 @@ impl<'a, A: SessionAuth, S: MailStore> Pop3Session<'a, A, S> {
                 PopReply::ok("Bye")
             }
             (_, PopCommand::Noop) => PopReply::ok(""),
+            // CAPA is valid in any phase; it lists STLS until TLS is active so a
+            // client knows it can (must) upgrade before authenticating (RFC 2449).
+            (_, PopCommand::Capa) => {
+                let mut reply = PopReply::ok("Capability list follows");
+                reply.lines = vec!["USER".to_string()];
+                if self.tls_available && !self.tls_active {
+                    reply.lines.push("STLS".to_string());
+                }
+                reply
+            }
+            // STLS is only valid before authentication (RFC 2595 §4). The socket
+            // loop performs the handshake after this `+OK`.
+            (PopState::Authorization, PopCommand::Stls) => {
+                if self.tls_active {
+                    PopReply::err("STLS already active")
+                } else if self.tls_available {
+                    PopReply::ok("Begin TLS negotiation")
+                } else {
+                    PopReply::err("STLS not supported")
+                }
+            }
+            (PopState::Transaction, PopCommand::Stls) => {
+                PopReply::err("STLS only allowed before authentication")
+            }
             (PopState::Authorization, PopCommand::User(name)) => {
-                self.pending_user = Some(name);
-                PopReply::ok("send PASS")
+                if self.tls_available && !self.tls_active {
+                    // Never accept credentials in cleartext when TLS is offered.
+                    PopReply::err("[AUTH] STLS required before authentication")
+                } else {
+                    self.pending_user = Some(name);
+                    PopReply::ok("send PASS")
+                }
             }
             (PopState::Authorization, PopCommand::Pass(password)) => {
+                if self.tls_available && !self.tls_active {
+                    return PopReply::err("[AUTH] STLS required before authentication");
+                }
                 let Some(user) = self.pending_user.take() else {
                     return PopReply::err("USER required first");
                 };
@@ -322,5 +386,63 @@ mod tests {
         assert!(s.handle(PopCommand::Quit).ok);
         // QUIT expunged the deleted message from the store.
         assert_eq!(store.count("bob@example.com"), 1);
+    }
+
+    #[test]
+    fn parses_capa_and_stls() {
+        assert_eq!(PopCommand::parse("CAPA").unwrap(), PopCommand::Capa);
+        assert_eq!(PopCommand::parse("STLS").unwrap(), PopCommand::Stls);
+    }
+
+    #[test]
+    fn capa_lists_stls_before_tls_and_not_after() {
+        let auth = auth();
+        let store = seeded_store("bob@example.com", 0);
+        let mut s = Pop3Session::with_tls(&auth, &store, false);
+        let before = s.handle(PopCommand::Capa);
+        assert!(
+            before.lines.iter().any(|l| l == "STLS"),
+            "{:?}",
+            before.lines
+        );
+
+        let mut s = Pop3Session::with_tls(&auth, &store, true);
+        let after = s.handle(PopCommand::Capa);
+        assert!(
+            !after.lines.iter().any(|l| l == "STLS"),
+            "{:?}",
+            after.lines
+        );
+    }
+
+    #[test]
+    fn user_pass_refused_before_tls_when_available() {
+        let auth = auth();
+        let store = seeded_store("bob@example.com", 1);
+        let mut s = Pop3Session::with_tls(&auth, &store, false);
+        let u = s.handle(PopCommand::User("bob@example.com".into()));
+        assert!(!u.ok, "USER must be refused before STLS");
+        let p = s.handle(PopCommand::Pass("pw".into()));
+        assert!(!p.ok, "PASS must be refused before STLS");
+        assert_eq!(s.state(), PopState::Authorization);
+    }
+
+    #[test]
+    fn stls_granted_then_auth_allowed_after_upgrade() {
+        let auth = auth();
+        let store = seeded_store("bob@example.com", 1);
+        // STLS offered before TLS, refused once active or when unsupported.
+        let mut s = Pop3Session::with_tls(&auth, &store, false);
+        assert!(s.handle(PopCommand::Stls).ok);
+        let mut s = Pop3Session::with_tls(&auth, &store, true);
+        assert!(!s.handle(PopCommand::Stls).ok);
+        let mut s = Pop3Session::new(&auth, &store);
+        assert!(!s.handle(PopCommand::Stls).ok);
+
+        // After the upgrade (active=true) USER/PASS authenticate normally.
+        let mut s = Pop3Session::with_tls(&auth, &store, true);
+        assert!(s.handle(PopCommand::User("bob@example.com".into())).ok);
+        assert!(s.handle(PopCommand::Pass("pw".into())).ok);
+        assert_eq!(s.state(), PopState::Transaction);
     }
 }

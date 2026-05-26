@@ -20,6 +20,8 @@ pub enum FetchItem {
 pub enum ImapCommand {
     /// `CAPABILITY`
     Capability,
+    /// `STARTTLS` — begin a TLS upgrade (RFC 2595 / RFC 3501).
+    StartTls,
     /// `LOGIN <user> <pass>`
     Login { username: String, password: String },
     /// `SELECT <mailbox>`
@@ -59,6 +61,7 @@ impl TaggedCommand {
         let args = parts.next().unwrap_or("").trim();
         let command = match verb.to_ascii_uppercase().as_str() {
             "CAPABILITY" => ImapCommand::Capability,
+            "STARTTLS" => ImapCommand::StartTls,
             "NOOP" => ImapCommand::Noop,
             "LOGOUT" => ImapCommand::Logout,
             "LOGIN" => {
@@ -130,10 +133,15 @@ pub struct ImapSession<'a, A: SessionAuth, S: MailStore> {
     state: ImapState,
     user: Option<String>,
     selected: Vec<StoredMessage>,
+    /// The server offers `STARTTLS` (a certificate is configured).
+    tls_available: bool,
+    /// The connection is already encrypted (a `STARTTLS` upgrade completed).
+    tls_active: bool,
 }
 
 impl<'a, A: SessionAuth, S: MailStore> ImapSession<'a, A, S> {
-    /// Start a session in the not-authenticated phase.
+    /// Start a session with no TLS offered (a plaintext-only listener — used when
+    /// the server has no certificate configured).
     pub fn new(auth: &'a A, store: &'a S) -> Self {
         Self {
             auth,
@@ -141,6 +149,26 @@ impl<'a, A: SessionAuth, S: MailStore> ImapSession<'a, A, S> {
             state: ImapState::NotAuthenticated,
             user: None,
             selected: Vec::new(),
+            tls_available: false,
+            tls_active: false,
+        }
+    }
+
+    /// Start a TLS-capable session. `active` is `true` when the connection is
+    /// already encrypted (i.e. the session that resumes after a `STARTTLS`
+    /// upgrade); `false` for the initial plaintext phase that advertises and
+    /// permits `STARTTLS`. While TLS is available but not yet active the session
+    /// advertises `LOGINDISABLED` and refuses `LOGIN`, so credentials are never
+    /// accepted in cleartext.
+    pub fn with_tls(auth: &'a A, store: &'a S, active: bool) -> Self {
+        Self {
+            auth,
+            store,
+            state: ImapState::NotAuthenticated,
+            user: None,
+            selected: Vec::new(),
+            tls_available: true,
+            tls_active: active,
         }
     }
 
@@ -172,10 +200,29 @@ impl<'a, A: SessionAuth, S: MailStore> ImapSession<'a, A, S> {
             status: format!("{tag} NO {status}"),
         };
         match tagged.command {
-            ImapCommand::Capability => ImapResponse {
-                untagged: vec!["CAPABILITY IMAP4rev1".to_string()],
-                status: format!("{tag} OK CAPABILITY completed"),
-            },
+            ImapCommand::Capability => {
+                // Advertise STARTTLS and LOGINDISABLED until the connection is
+                // encrypted, so conforming clients refuse to send credentials in
+                // cleartext (RFC 3501 §6.2.1, §7.2.1; RFC 2595).
+                let mut caps = String::from("CAPABILITY IMAP4rev1");
+                if self.tls_available && !self.tls_active {
+                    caps.push_str(" STARTTLS LOGINDISABLED");
+                }
+                ImapResponse {
+                    untagged: vec![caps],
+                    status: format!("{tag} OK CAPABILITY completed"),
+                }
+            }
+            ImapCommand::StartTls => {
+                if self.tls_active {
+                    no("STARTTLS already active")
+                } else if self.tls_available {
+                    // The socket loop performs the handshake after this reply.
+                    ok("Begin TLS negotiation now")
+                } else {
+                    no("STARTTLS not supported")
+                }
+            }
             ImapCommand::Noop => ok("NOOP completed"),
             ImapCommand::Logout => {
                 self.state = ImapState::NotAuthenticated;
@@ -185,7 +232,10 @@ impl<'a, A: SessionAuth, S: MailStore> ImapSession<'a, A, S> {
                 }
             }
             ImapCommand::Login { username, password } => {
-                if self.auth.check(&username, &password) {
+                if self.tls_available && !self.tls_active {
+                    // LOGINDISABLED: never accept credentials before STARTTLS.
+                    no("[PRIVACYREQUIRED] LOGIN disabled until STARTTLS")
+                } else if self.auth.check(&username, &password) {
                     self.user = Some(username);
                     self.state = ImapState::Authenticated;
                     ok("LOGIN completed")
@@ -311,5 +361,74 @@ mod tests {
         let r = s.handle(TaggedCommand::parse("A1 LOGIN bob@example.com wrong").unwrap());
         assert!(r.status.contains("NO"));
         assert_eq!(s.state(), ImapState::NotAuthenticated);
+    }
+
+    #[test]
+    fn parses_starttls() {
+        let cmd = TaggedCommand::parse("a STARTTLS").unwrap();
+        assert_eq!(cmd.command, ImapCommand::StartTls);
+    }
+
+    #[test]
+    fn capability_advertises_starttls_and_logindisabled_before_tls() {
+        let (auth, store) = (StubAuth, store_with(0));
+        let mut s = ImapSession::with_tls(&auth, &store, false);
+        let r = s.handle(TaggedCommand::parse("A1 CAPABILITY").unwrap());
+        assert!(r.untagged[0].contains("STARTTLS"), "{:?}", r.untagged);
+        assert!(r.untagged[0].contains("LOGINDISABLED"), "{:?}", r.untagged);
+    }
+
+    #[test]
+    fn capability_drops_starttls_and_logindisabled_after_tls() {
+        let (auth, store) = (StubAuth, store_with(0));
+        let mut s = ImapSession::with_tls(&auth, &store, true);
+        let r = s.handle(TaggedCommand::parse("A1 CAPABILITY").unwrap());
+        assert!(!r.untagged[0].contains("STARTTLS"), "{:?}", r.untagged);
+        assert!(!r.untagged[0].contains("LOGINDISABLED"), "{:?}", r.untagged);
+    }
+
+    #[test]
+    fn login_refused_before_tls_when_available() {
+        let (auth, store) = (StubAuth, store_with(0));
+        let mut s = ImapSession::with_tls(&auth, &store, false);
+        let r = s.handle(TaggedCommand::parse("A1 LOGIN bob@example.com pw").unwrap());
+        assert!(r.status.contains("NO"), "{}", r.status);
+        assert!(r.status.contains("PRIVACYREQUIRED"), "{}", r.status);
+        assert_eq!(s.state(), ImapState::NotAuthenticated);
+    }
+
+    #[test]
+    fn login_allowed_after_tls_upgrade() {
+        let (auth, store) = (StubAuth, store_with(0));
+        let mut s = ImapSession::with_tls(&auth, &store, true);
+        let r = s.handle(TaggedCommand::parse("A1 LOGIN bob@example.com pw").unwrap());
+        assert!(r.status.contains("OK"), "{}", r.status);
+        assert_eq!(s.state(), ImapState::Authenticated);
+    }
+
+    #[test]
+    fn starttls_granted_when_available_and_refused_otherwise() {
+        let (auth, store) = (StubAuth, store_with(0));
+        // Available, not yet active: granted.
+        let mut s = ImapSession::with_tls(&auth, &store, false);
+        assert!(
+            s.handle(TaggedCommand::parse("A1 STARTTLS").unwrap())
+                .status
+                .contains("OK")
+        );
+        // Already active: refused.
+        let mut s = ImapSession::with_tls(&auth, &store, true);
+        assert!(
+            s.handle(TaggedCommand::parse("A1 STARTTLS").unwrap())
+                .status
+                .contains("NO")
+        );
+        // No certificate configured: refused.
+        let mut s = ImapSession::new(&auth, &store);
+        assert!(
+            s.handle(TaggedCommand::parse("A1 STARTTLS").unwrap())
+                .status
+                .contains("NO")
+        );
     }
 }
