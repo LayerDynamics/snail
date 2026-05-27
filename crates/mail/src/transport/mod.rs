@@ -9,4 +9,4 @@ pub mod smtp;
 pub use inbound::{DEFAULT_MAX_MESSAGE_SIZE, InboundCollector};
 pub use mta::{InboundResult, Mta, Route};
 pub use outbound::{RelayScript, relay_script};
-pub use smtp::{Phase, SmtpCommand, SmtpReply, SmtpSession};
+pub use smtp::{DEFAULT_MAX_RECIPIENTS, Phase, SmtpCommand, SmtpReply, SmtpSession};

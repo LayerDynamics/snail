@@ -127,6 +127,12 @@ pub enum Phase {
     Closed,
 }
 
+/// Default maximum recipients accepted per transaction. RFC 5321 §4.5.3.1.8 sets
+/// a *floor* of 100 (a server must accept at least that many); this is the ceiling
+/// above which further `RCPT TO` are refused with `452`, bounding both the
+/// recipient `Vec` and the post-`DATA` per-recipient delivery fan-out.
+pub const DEFAULT_MAX_RECIPIENTS: usize = 1000;
+
 /// A server-side SMTP session: feed it commands, get replies; once a transaction
 /// completes it yields the [`Envelope`] and the session collects the DATA body.
 #[derive(Debug)]
@@ -135,6 +141,7 @@ pub struct SmtpSession {
     helo: Option<String>,
     sender: Option<Mailbox>,
     recipients: Vec<Mailbox>,
+    max_recipients: usize,
 }
 
 impl Default for SmtpSession {
@@ -144,15 +151,26 @@ impl Default for SmtpSession {
             helo: None,
             sender: None,
             recipients: Vec::new(),
+            max_recipients: DEFAULT_MAX_RECIPIENTS,
         }
     }
 }
 
 impl SmtpSession {
-    /// A fresh session in the greeting phase.
+    /// A fresh session in the greeting phase, with the default recipient cap.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A fresh session with an explicit maximum recipient count (RFC 5321 requires
+    /// at least 100; lower values are for tests).
+    #[must_use]
+    pub fn with_max_recipients(max_recipients: usize) -> Self {
+        Self {
+            max_recipients,
+            ..Self::default()
+        }
     }
 
     /// The current phase.
@@ -192,9 +210,15 @@ impl SmtpSession {
                 SmtpReply::new(250, "OK")
             }
             (Phase::Sender | Phase::Recipients, SmtpCommand::RcptTo(rcpt)) => {
-                self.recipients.push(rcpt);
-                self.phase = Phase::Recipients;
-                SmtpReply::new(250, "OK")
+                if self.recipients.len() >= self.max_recipients {
+                    // Refuse further recipients (RFC 5321 §4.5.3.1.10) — the
+                    // already-accepted ones still form a valid transaction.
+                    SmtpReply::new(452, "4.5.3 Too many recipients")
+                } else {
+                    self.recipients.push(rcpt);
+                    self.phase = Phase::Recipients;
+                    SmtpReply::new(250, "OK")
+                }
             }
             (Phase::Recipients, SmtpCommand::Data) => {
                 self.phase = Phase::Data;
@@ -265,6 +289,38 @@ mod tests {
         let env = s.take_envelope().unwrap();
         assert_eq!(env.recipients.len(), 1);
         assert_eq!(env.sender.unwrap().to_string(), "a@x.com");
+    }
+
+    #[test]
+    fn recipients_past_the_cap_are_refused() {
+        // Tight cap of 2: the first two RCPT are accepted, the third is refused
+        // with 452, and the transaction still delivers to the accepted two.
+        let mut s = SmtpSession::with_max_recipients(2);
+        s.handle(SmtpCommand::parse("EHLO x").unwrap());
+        s.handle(SmtpCommand::parse("MAIL FROM:<a@x.com>").unwrap());
+        assert_eq!(
+            s.handle(SmtpCommand::parse("RCPT TO:<b@y.com>").unwrap())
+                .code,
+            250
+        );
+        assert_eq!(
+            s.handle(SmtpCommand::parse("RCPT TO:<c@y.com>").unwrap())
+                .code,
+            250
+        );
+        assert_eq!(
+            s.handle(SmtpCommand::parse("RCPT TO:<d@y.com>").unwrap())
+                .code,
+            452,
+            "a recipient past the cap must be refused"
+        );
+        assert_eq!(s.handle(SmtpCommand::Data).code, 354);
+        let env = s.take_envelope().unwrap();
+        assert_eq!(
+            env.recipients.len(),
+            2,
+            "only the accepted recipients remain"
+        );
     }
 
     #[test]
