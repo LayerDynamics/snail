@@ -1591,4 +1591,59 @@ mod tests {
 
         handle.abort();
     }
+
+    #[tokio::test]
+    async fn tcp_pop_rejects_overlong_line() {
+        // A single line longer than MAX_LINE_LENGTH (no newline) must be refused
+        // (-ERR) and the connection closed — never buffered whole into the parser.
+        let server = Arc::new(Server::new(&ServerConfig::new(["example.com".to_string()])));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        {
+            let srv = Arc::clone(&server);
+            tokio::spawn(async move {
+                let (s, peer) = listener.accept().await.unwrap();
+                serve_pop(s, peer, srv).await.unwrap();
+            });
+        }
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (cr, mut cw) = client.into_split();
+        let mut cr = BufReader::new(cr);
+        assert!(read_line(&mut cr).await.starts_with("+OK"));
+        cw.write_all(&vec![b'A'; MAX_LINE_LENGTH + 4096])
+            .await
+            .unwrap();
+        let reply = read_line(&mut cr).await;
+        assert!(
+            reply.starts_with("-ERR"),
+            "POP3 over-long line must be refused with -ERR, got {reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_imap_rejects_overlong_line() {
+        // Likewise for IMAP: an over-long line is refused (* BAD) and closed.
+        let server = Arc::new(Server::new(&ServerConfig::new(["example.com".to_string()])));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        {
+            let srv = Arc::clone(&server);
+            tokio::spawn(async move {
+                let (s, peer) = listener.accept().await.unwrap();
+                serve_imap(s, peer, srv).await.unwrap();
+            });
+        }
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (cr, mut cw) = client.into_split();
+        let mut cr = BufReader::new(cr);
+        assert!(read_line(&mut cr).await.starts_with("* OK"));
+        cw.write_all(&vec![b'A'; MAX_LINE_LENGTH + 4096])
+            .await
+            .unwrap();
+        let reply = read_line(&mut cr).await;
+        assert!(
+            reply.starts_with("* BAD"),
+            "IMAP over-long line must be refused with * BAD, got {reply:?}"
+        );
+    }
 }
