@@ -6,6 +6,7 @@ pub mod credential;
 pub mod encryption;
 pub mod error;
 pub mod firewall;
+pub mod throttle;
 
 pub use audit::{AuditConfig, AuditEvent, AuditLog, AuditManager};
 pub use credential::{
@@ -14,3 +15,4 @@ pub use credential::{
 pub use encryption::{PasswordHasher, SecretCipher};
 pub use error::{Result, SecurityError};
 pub use firewall::{Decision, DenyReason, Firewall, FirewallConfig, FirewallManager};
+pub use throttle::{AuthThrottle, ThrottleConfig};

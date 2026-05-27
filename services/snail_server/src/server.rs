@@ -12,7 +12,10 @@ use mail::{
     Message, Mta,
 };
 use network::DnsResolver;
-use security::{Credential, CredentialStore, Firewall, FirewallConfig, MemoryCredentialStore};
+use security::{
+    AuthThrottle, Credential, CredentialStore, Firewall, FirewallConfig, MemoryCredentialStore,
+    ThrottleConfig,
+};
 
 use crate::config::ServerConfig;
 use crate::spool::OutboundSpool;
@@ -72,6 +75,7 @@ pub struct Server {
     helo: String,
     relay: Option<RelayContext>,
     firewall: Arc<Firewall>,
+    auth_throttle: Arc<AuthThrottle>,
 }
 
 impl Server {
@@ -96,6 +100,7 @@ impl Server {
             helo,
             relay: None,
             firewall: Arc::new(Firewall::new(&FirewallConfig::default())),
+            auth_throttle: Arc::new(AuthThrottle::new(ThrottleConfig::default())),
         }
     }
 
@@ -111,6 +116,21 @@ impl Server {
     #[must_use]
     pub fn firewall(&self) -> &Firewall {
         &self.firewall
+    }
+
+    /// Replace the per-IP brute-force authentication throttle (consulted by the
+    /// IMAP/POP3/submission loops on each credential check). Defaults to
+    /// [`ThrottleConfig::default`]; tests use a tight policy.
+    #[must_use]
+    pub fn with_auth_throttle(mut self, config: ThrottleConfig) -> Self {
+        self.auth_throttle = Arc::new(AuthThrottle::new(config));
+        self
+    }
+
+    /// The brute-force authentication throttle shared across client connections.
+    #[must_use]
+    pub fn auth_throttle(&self) -> &AuthThrottle {
+        &self.auth_throttle
     }
 
     /// Enable outbound relay: queue remote mail to `spool` and deliver it by

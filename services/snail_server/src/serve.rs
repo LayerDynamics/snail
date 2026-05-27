@@ -70,9 +70,9 @@ pub async fn run(server: Arc<Server>, listeners: &Listeners) -> std::io::Result<
 
     loop {
         tokio::select! {
-            Ok((stream, _)) = submission.accept() => spawn(serve_submission(stream, Arc::clone(&server))),
-            Ok((stream, _)) = pop3.accept() => spawn(serve_pop(stream, Arc::clone(&server))),
-            Ok((stream, _)) = imap.accept() => spawn(serve_imap(stream, Arc::clone(&server))),
+            Ok((stream, peer)) = submission.accept() => spawn(serve_submission(stream, peer, Arc::clone(&server))),
+            Ok((stream, peer)) = pop3.accept() => spawn(serve_pop(stream, peer, Arc::clone(&server))),
+            Ok((stream, peer)) = imap.accept() => spawn(serve_imap(stream, peer, Arc::clone(&server))),
             Ok((stream, peer)) = inbound.accept() => spawn(serve_inbound_firewalled(stream, peer, Arc::clone(&server))),
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("shutdown signal received");
@@ -123,7 +123,11 @@ pub async fn serve_inbound_firewalled(
 ///
 /// # Errors
 /// [`std::io::Error`] on socket failure.
-pub async fn serve_submission(stream: TcpStream, server: Arc<Server>) -> std::io::Result<()> {
+pub async fn serve_submission(
+    stream: TcpStream,
+    peer: SocketAddr,
+    server: Arc<Server>,
+) -> std::io::Result<()> {
     let has_tls = server.tls_config().is_some();
     let mut conn = BufReader::new(MaybeTlsStream::Plain(stream));
     let mut msa = MsaSession::new(server.authenticator());
@@ -190,6 +194,15 @@ pub async fn serve_submission(stream: TcpStream, server: Arc<Server>) -> std::io
                     .await?;
                 continue;
             }
+            // This attempt actually checks credentials, so it is subject to the
+            // brute-force throttle. A locked-out IP is refused and disconnected.
+            if !server.auth_throttle().check(peer.ip()) {
+                conn.write_all(
+                    b"421 4.7.0 too many failed authentication attempts; try again later\r\n",
+                )
+                .await?;
+                break;
+            }
             let reply = match rest.trim() {
                 "" => SmtpReplyText::new(501, "AUTH PLAIN requires an initial response"),
                 b64 => {
@@ -197,6 +210,11 @@ pub async fn serve_submission(stream: TcpStream, server: Arc<Server>) -> std::io
                     SmtpReplyText::new(r.code, &r.text)
                 }
             };
+            match reply.code {
+                235 => server.auth_throttle().record_success(peer.ip()),
+                535 => server.auth_throttle().record_failure(peer.ip()),
+                _ => {} // malformed response (501): not a credential guess
+            }
             conn.write_all(reply.to_wire().as_bytes()).await?;
             continue;
         }
@@ -412,13 +430,27 @@ async fn accept_tls(
     Ok(BufReader::new(MaybeTlsStream::Tls(Box::new(upgraded))))
 }
 
+/// Whether an auth command on this connection will actually verify credentials,
+/// rather than being refused by the TLS-required policy (LOGINDISABLED / pre-STLS
+/// / pre-STARTTLS). Only credential-checking attempts are counted toward the
+/// brute-force throttle, so a client that merely ignores the "encrypt first"
+/// policy is not locked out.
+fn credentials_checked(has_tls: bool, conn: &BufReader<MaybeTlsStream>) -> bool {
+    !has_tls || matches!(conn.get_ref(), MaybeTlsStream::Tls(_))
+}
+
 /// Serve one POP3 connection.
 ///
 /// # Errors
 /// [`std::io::Error`] on socket failure.
-pub async fn serve_pop(stream: TcpStream, server: Arc<Server>) -> std::io::Result<()> {
+pub async fn serve_pop(
+    stream: TcpStream,
+    peer: SocketAddr,
+    server: Arc<Server>,
+) -> std::io::Result<()> {
+    let has_tls = server.tls_config().is_some();
     let mut conn = BufReader::new(MaybeTlsStream::Plain(stream));
-    let mut session = if server.tls_config().is_some() {
+    let mut session = if has_tls {
         Pop3Session::with_tls(server.authenticator(), server.store(), false)
     } else {
         Pop3Session::new(server.authenticator(), server.store())
@@ -452,6 +484,22 @@ pub async fn serve_pop(stream: TcpStream, server: Arc<Server>) -> std::io::Resul
                     session = Pop3Session::with_tls(server.authenticator(), server.store(), true);
                 }
                 continue;
+            }
+            // PASS is the credential guess. When it actually checks credentials
+            // (i.e. not refused by the pre-STLS policy), it is throttled per IP.
+            Ok(command @ PopCommand::Pass(_)) if credentials_checked(has_tls, &conn) => {
+                if !server.auth_throttle().check(peer.ip()) {
+                    conn.write_all(b"-ERR [AUTH] too many failed attempts; try again later\r\n")
+                        .await?;
+                    break;
+                }
+                let reply = session.handle(command);
+                if reply.ok {
+                    server.auth_throttle().record_success(peer.ip());
+                } else {
+                    server.auth_throttle().record_failure(peer.ip());
+                }
+                write_pop_reply(&mut conn, &reply).await?;
             }
             Ok(command) => {
                 let reply = session.handle(command);
@@ -494,9 +542,14 @@ async fn write_pop_reply<W: AsyncWrite + Unpin>(
 ///
 /// # Errors
 /// [`std::io::Error`] on socket failure.
-pub async fn serve_imap(stream: TcpStream, server: Arc<Server>) -> std::io::Result<()> {
+pub async fn serve_imap(
+    stream: TcpStream,
+    peer: SocketAddr,
+    server: Arc<Server>,
+) -> std::io::Result<()> {
+    let has_tls = server.tls_config().is_some();
     let mut conn = BufReader::new(MaybeTlsStream::Plain(stream));
-    let mut session = if server.tls_config().is_some() {
+    let mut session = if has_tls {
         ImapSession::with_tls(server.authenticator(), server.store(), false)
     } else {
         ImapSession::new(server.authenticator(), server.store())
@@ -531,6 +584,33 @@ pub async fn serve_imap(stream: TcpStream, server: Arc<Server>) -> std::io::Resu
                     conn = accept_tls(conn, config).await?;
                     session = ImapSession::with_tls(server.authenticator(), server.store(), true);
                 }
+            }
+            // LOGIN is the credential guess. When it actually checks credentials
+            // (i.e. not refused by LOGINDISABLED), it is throttled per IP.
+            Ok(tagged)
+                if matches!(tagged.command, ImapCommand::Login { .. })
+                    && credentials_checked(has_tls, &conn) =>
+            {
+                let tag = tagged.tag.clone();
+                if !server.auth_throttle().check(peer.ip()) {
+                    conn.write_all(
+                        format!(
+                            "{tag} NO [UNAVAILABLE] too many failed attempts; try again later\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+                    break;
+                }
+                let response = session.handle(tagged);
+                // The tagged status is `<tag> OK ...` on success, `<tag> NO ...` on
+                // a credential mismatch.
+                if response.status.split_whitespace().nth(1) == Some("OK") {
+                    server.auth_throttle().record_success(peer.ip());
+                } else {
+                    server.auth_throttle().record_failure(peer.ip());
+                }
+                write_imap_response(&mut conn, &response).await?;
             }
             Ok(tagged) => {
                 let is_logout = matches!(tagged.command, ImapCommand::Logout);
@@ -622,15 +702,15 @@ mod tests {
         {
             let srv = Arc::clone(&server);
             tokio::spawn(async move {
-                let (s, _) = sub.accept().await.unwrap();
-                serve_submission(s, srv).await.unwrap();
+                let (s, peer) = sub.accept().await.unwrap();
+                serve_submission(s, peer, srv).await.unwrap();
             });
         }
         {
             let srv = Arc::clone(&server);
             tokio::spawn(async move {
-                let (s, _) = pop.accept().await.unwrap();
-                serve_pop(s, srv).await.unwrap();
+                let (s, peer) = pop.accept().await.unwrap();
+                serve_pop(s, peer, srv).await.unwrap();
             });
         }
 
@@ -870,8 +950,8 @@ mod tests {
         {
             let srv = Arc::clone(&server);
             tokio::spawn(async move {
-                let (s, _) = listener.accept().await.unwrap();
-                serve_submission(s, srv).await.unwrap();
+                let (s, peer) = listener.accept().await.unwrap();
+                serve_submission(s, peer, srv).await.unwrap();
             });
         }
 
@@ -940,8 +1020,8 @@ mod tests {
         {
             let srv = Arc::clone(&server);
             tokio::spawn(async move {
-                let (s, _) = listener.accept().await.unwrap();
-                serve_pop(s, srv).await.unwrap();
+                let (s, peer) = listener.accept().await.unwrap();
+                serve_pop(s, peer, srv).await.unwrap();
             });
         }
 
@@ -1013,8 +1093,8 @@ mod tests {
         {
             let srv = Arc::clone(&server);
             tokio::spawn(async move {
-                let (s, _) = listener.accept().await.unwrap();
-                serve_imap(s, srv).await.unwrap();
+                let (s, peer) = listener.accept().await.unwrap();
+                serve_imap(s, peer, srv).await.unwrap();
             });
         }
 
@@ -1137,5 +1217,54 @@ mod tests {
         let body = String::from_utf8_lossy(&bytes);
         assert!(body.contains("Injected message"), "{body}");
         assert!(body.contains("MAIL FROM:<spoofed@example.com>"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn pop_locks_out_after_repeated_auth_failures() {
+        use security::ThrottleConfig;
+        use std::time::Duration;
+
+        // A tight throttle: two failed credential guesses from an IP lock it out.
+        let mut server = Server::new(&ServerConfig::new(["example.com".to_string()]))
+            .with_auth_throttle(ThrottleConfig {
+                max_failures: 2,
+                lockout: Duration::from_secs(900),
+            });
+        server.register_user("bob@example.com", "pw").unwrap();
+        let server = Arc::new(server);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        {
+            let srv = Arc::clone(&server);
+            tokio::spawn(async move {
+                let (s, peer) = listener.accept().await.unwrap();
+                serve_pop(s, peer, srv).await.unwrap();
+            });
+        }
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (cr, mut cw) = client.into_split();
+        let mut cr = BufReader::new(cr);
+        assert!(read_line(&mut cr).await.starts_with("+OK"));
+
+        // Two wrong-password guesses are answered with -ERR (and counted).
+        for _ in 0..2 {
+            cw.write_all(b"USER bob@example.com\r\n").await.unwrap();
+            assert!(read_line(&mut cr).await.starts_with("+OK"));
+            cw.write_all(b"PASS wrong\r\n").await.unwrap();
+            assert!(read_line(&mut cr).await.starts_with("-ERR"));
+        }
+
+        // The IP is now locked out: the next guess is refused with the lockout
+        // message (and the connection is closed), even though USER still answers.
+        cw.write_all(b"USER bob@example.com\r\n").await.unwrap();
+        assert!(read_line(&mut cr).await.starts_with("+OK"));
+        cw.write_all(b"PASS wrong\r\n").await.unwrap();
+        let locked = read_line(&mut cr).await;
+        assert!(
+            locked.starts_with("-ERR") && locked.contains("too many"),
+            "expected a lockout reply, got {locked:?}"
+        );
     }
 }

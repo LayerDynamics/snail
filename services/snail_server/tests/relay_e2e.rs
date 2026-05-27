@@ -82,8 +82,8 @@ async fn submission_relays_across_servers_to_inbound_receiver() {
     {
         let s = Arc::clone(&sender);
         tokio::spawn(async move {
-            let (c, _) = sub_listener.accept().await.unwrap();
-            serve_submission(c, s).await.unwrap();
+            let (c, peer) = sub_listener.accept().await.unwrap();
+            serve_submission(c, peer, s).await.unwrap();
         });
     }
 
@@ -182,8 +182,8 @@ async fn submission_relays_over_starttls_across_servers() {
     {
         let s = Arc::clone(&sender);
         tokio::spawn(async move {
-            let (c, _) = sub_listener.accept().await.unwrap();
-            serve_submission(c, s).await.unwrap();
+            let (c, peer) = sub_listener.accept().await.unwrap();
+            serve_submission(c, peer, s).await.unwrap();
         });
     }
 

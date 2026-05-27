@@ -10,13 +10,13 @@ There is intentionally **no built-in `@<company>.com`** — a **custom domain is
 
 ## Current state — READ THIS FIRST
 
-The **entire Rust engine is built, tested, and runs as a full internet MTA** (milestones m0–m16). The composition root boots and serves mail end-to-end — local delivery, retrieval, **outbound relay to remote MX**, and **inbound MX reception over STARTTLS** behind a firewall. **Every client-facing listener (submission, POP3, IMAP) advertises and performs STARTTLS/STLS and refuses plaintext credentials when a certificate is configured**, so logins and mail are never exposed in cleartext. The TypeScript tooling and the FFI client binding are the only parts still empty.
+The **entire Rust engine is built, tested, and runs as a full internet MTA** (milestones m0–m16). The composition root boots and serves mail end-to-end — local delivery, retrieval, **outbound relay to remote MX**, and **inbound MX reception over STARTTLS** behind a firewall. **Every client-facing listener (submission, POP3, IMAP) advertises and performs STARTTLS/STLS, refuses plaintext credentials when a certificate is configured, and is brute-force throttled** (a per-IP `security::AuthThrottle` on `Server`, consulted in each loop's credential check — lockout after repeated failures), so logins and mail are never exposed in cleartext and credential guessing is rate-limited. The TypeScript tooling and the FFI client binding are the only parts still empty.
 
 - **Built, tested, committed (9 workspace members, ~151 tests, all clippy `-D warnings` + fmt clean):**
   - `crates/utilities` — typed `UtilError` + process `Config`.
   - `services/telemetry` — `tracing` + OpenTelemetry pipeline (`init()` → `TelemetryGuard`) + `telemetry selftest` binary.
   - `crates/network` — async DNS (hickory `DnsResolver`, MX lookup) + rustls/rcgen TLS config (m9).
-  - `crates/security` — argon2 `PasswordHasher`, chacha20poly1305 `SecretCipher`, `CredentialStore`, governor `Firewall`, `AuditLog` (m10).
+  - `crates/security` — argon2 `PasswordHasher`, chacha20poly1305 `SecretCipher`, `CredentialStore`, governor `Firewall`, per-IP `AuthThrottle` (brute-force lockout), `AuditLog` (m10).
   - `crates/identity` — account model, password auth, SASL `PLAIN`/`LOGIN`/`XOAUTH2`, connection state (m11).
   - `crates/mail` — RFC 5322 message model, `MailStore` + in-memory store, MDA delivery, SMTP parser + server session, inbound DATA collection (`InboundCollector` requires a genuine `<CRLF>.<CRLF>` end-of-data and normalises bare newlines — SMTP-smuggling hardened), outbound relay script, `Mta` local/remote routing, content scanner, STARTTLS policy, mail-flow metrics (m12).
   - `crates/access` — POP3, IMAP, MSA submission sessions (each modelling `STLS`/`STARTTLS` + capability advertisement + plaintext-auth refusal until TLS is active; the MSA also binds `MAIL FROM` to the authenticated user per RFC 6409, refusing sender spoofing with `553`), Dovecot Maildir++ mapping, web access, `AccessManager` (m13).
