@@ -26,6 +26,61 @@ use crate::worker::spawn_relay_worker;
 /// How often the relay worker scans the spool for due messages.
 const RELAY_WORKER_TICK: Duration = Duration::from_secs(30);
 
+/// Maximum bytes in a single protocol line, including its terminator. A line over
+/// this is rejected and the connection closed — an unbounded `read_line` on the
+/// public port is a memory-exhaustion DoS (one enormous line with no newline).
+const MAX_LINE_LENGTH: usize = 64 * 1024;
+
+/// Outcome of a length-capped line read.
+enum LineRead {
+    /// A full line (terminator included, decoded lossily) was read into the buffer.
+    Read,
+    /// The peer closed the connection.
+    Eof,
+    /// The line exceeded [`MAX_LINE_LENGTH`] before a newline arrived.
+    TooLong,
+}
+
+/// Read one line (up to and including `\n`) into `buf`, never buffering more than
+/// `max` bytes. On overflow it stops and returns [`LineRead::TooLong`] **without
+/// draining the rest** — the caller closes the connection, so the unread bytes are
+/// abandoned with the socket (draining would re-introduce the unbounded read we
+/// are closing). Bytes are decoded with [`String::from_utf8_lossy`], so 8-bit
+/// input never aborts the connection with a UTF-8 error.
+async fn read_line_capped<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    buf: &mut String,
+    max: usize,
+) -> std::io::Result<LineRead> {
+    buf.clear();
+    let mut raw: Vec<u8> = Vec::new();
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            if raw.is_empty() {
+                return Ok(LineRead::Eof);
+            }
+            // EOF mid-line (no trailing newline): take what arrived.
+            buf.push_str(&String::from_utf8_lossy(&raw));
+            return Ok(LineRead::Read);
+        }
+        let newline = chunk.iter().position(|&b| b == b'\n');
+        let take = newline.map_or(chunk.len(), |p| p + 1);
+        if raw.len() + take > max {
+            let room = max - raw.len();
+            raw.extend_from_slice(&chunk[..room]);
+            reader.consume(room);
+            return Ok(LineRead::TooLong);
+        }
+        raw.extend_from_slice(&chunk[..take]);
+        reader.consume(take);
+        if newline.is_some() {
+            buf.push_str(&String::from_utf8_lossy(&raw));
+            return Ok(LineRead::Read);
+        }
+    }
+}
+
 /// Bind addresses for the protocol listeners.
 #[derive(Debug, Clone)]
 pub struct Listeners {
@@ -137,13 +192,24 @@ pub async fn serve_submission(
     let mut line = String::new();
     loop {
         line.clear();
-        if conn.read_line(&mut line).await? == 0 {
-            break;
+        match read_line_capped(&mut conn, &mut line, MAX_LINE_LENGTH).await? {
+            LineRead::Read => {}
+            LineRead::Eof => break,
+            LineRead::TooLong => {
+                conn.write_all(b"500 line too long; closing\r\n").await?;
+                break;
+            }
         }
 
         // DATA body mode: accumulate until the lone "." line.
         if let Some(collector) = collecting.as_mut() {
-            if collector.push_line(&line) {
+            let done = collector.push_line(&line);
+            if collector.size_exceeded() {
+                conn.write_all(b"552 message exceeds the maximum size; closing\r\n")
+                    .await?;
+                break;
+            }
+            if done {
                 let collector = collecting.take().expect("collecting was Some");
                 let reply = match msa.smtp_mut().take_envelope() {
                     Some(envelope) => match collector.into_message(envelope) {
@@ -243,7 +309,7 @@ pub async fn serve_submission(
                 conn.write_all(format!("{} {}\r\n", reply.code, reply.text).as_bytes())
                     .await?;
                 if reply.code == 354 {
-                    collecting = Some(InboundCollector::new());
+                    collecting = Some(InboundCollector::with_max_size(server.max_message_size()));
                 }
                 if is_quit {
                     break;
@@ -276,13 +342,24 @@ pub async fn serve_inbound(stream: TcpStream, server: Arc<Server>) -> std::io::R
     let mut line = String::new();
     loop {
         line.clear();
-        if conn.read_line(&mut line).await? == 0 {
-            break;
+        match read_line_capped(&mut conn, &mut line, MAX_LINE_LENGTH).await? {
+            LineRead::Read => {}
+            LineRead::Eof => break,
+            LineRead::TooLong => {
+                conn.write_all(b"500 line too long; closing\r\n").await?;
+                break;
+            }
         }
 
         // DATA body mode: accumulate until the lone "." line, then deliver.
         if let Some(collector) = collecting.as_mut() {
-            if collector.push_line(&line) {
+            let done = collector.push_line(&line);
+            if collector.size_exceeded() {
+                conn.write_all(b"552 message exceeds the maximum size; closing\r\n")
+                    .await?;
+                break;
+            }
+            if done {
                 let collector = collecting.take().expect("collecting was Some");
                 let reply = match session.take_envelope() {
                     Some(envelope) => match collector.into_message(envelope) {
@@ -345,7 +422,7 @@ pub async fn serve_inbound(stream: TcpStream, server: Arc<Server>) -> std::io::R
                 let reply = session.handle(command);
                 conn.write_all(reply.to_wire().as_bytes()).await?;
                 if reply.code == 354 {
-                    collecting = Some(InboundCollector::new());
+                    collecting = Some(InboundCollector::with_max_size(server.max_message_size()));
                 }
                 if is_quit {
                     break;
@@ -460,8 +537,13 @@ pub async fn serve_pop(
     let mut line = String::new();
     loop {
         line.clear();
-        if conn.read_line(&mut line).await? == 0 {
-            break;
+        match read_line_capped(&mut conn, &mut line, MAX_LINE_LENGTH).await? {
+            LineRead::Read => {}
+            LineRead::Eof => break,
+            LineRead::TooLong => {
+                conn.write_all(b"-ERR line too long; closing\r\n").await?;
+                break;
+            }
         }
         let is_quit = line.trim_end().eq_ignore_ascii_case("QUIT");
         match PopCommand::parse(&line) {
@@ -559,8 +641,13 @@ pub async fn serve_imap(
     let mut line = String::new();
     loop {
         line.clear();
-        if conn.read_line(&mut line).await? == 0 {
-            break;
+        match read_line_capped(&mut conn, &mut line, MAX_LINE_LENGTH).await? {
+            LineRead::Read => {}
+            LineRead::Eof => break,
+            LineRead::TooLong => {
+                conn.write_all(b"* BAD line too long; closing\r\n").await?;
+                break;
+            }
         }
         match TaggedCommand::parse(&line) {
             // STARTTLS: upgrade the socket, then resume in a fresh (encrypted)
@@ -1217,6 +1304,95 @@ mod tests {
         let body = String::from_utf8_lossy(&bytes);
         assert!(body.contains("Injected message"), "{body}");
         assert!(body.contains("MAIL FROM:<spoofed@example.com>"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn tcp_inbound_rejects_oversize_message() {
+        // A tiny message cap; an inbound DATA body larger than it must be refused
+        // with 552 and the connection closed — never buffered to OOM.
+        let server = Arc::new(
+            Server::new(&ServerConfig::new(["example.com".to_string()]))
+                .with_max_message_size(1024),
+        );
+        let inbound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = inbound.local_addr().unwrap();
+        {
+            let srv = Arc::clone(&server);
+            tokio::spawn(async move {
+                let (s, _) = inbound.accept().await.unwrap();
+                serve_inbound(s, srv).await.unwrap();
+            });
+        }
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (cr, mut cw) = client.into_split();
+        let mut cr = BufReader::new(cr);
+        assert!(read_line(&mut cr).await.starts_with("220"));
+        for (cmd, expect) in [
+            ("EHLO mx.test", "250"),
+            ("MAIL FROM:<a@remote.test>", "250"),
+            ("RCPT TO:<bob@example.com>", "250"),
+            ("DATA", "354"),
+        ] {
+            cw.write_all(format!("{cmd}\r\n").as_bytes()).await.unwrap();
+            assert!(read_line(&mut cr).await.starts_with(expect), "cmd {cmd}");
+        }
+        // ~4 KiB of body across many short lines, well over the 1 KiB cap.
+        cw.write_all(b"Subject: big\r\n\r\n").await.unwrap();
+        for _ in 0..64 {
+            cw.write_all(format!("{}\r\n", "x".repeat(64)).as_bytes())
+                .await
+                .unwrap();
+        }
+        cw.write_all(b".\r\n").await.unwrap();
+        // Drain replies until the 552 lands (earlier writes may have been answered).
+        let mut saw_552 = false;
+        for _ in 0..200 {
+            let line = read_line(&mut cr).await;
+            if line.is_empty() {
+                break; // connection closed
+            }
+            if line.starts_with("552") {
+                saw_552 = true;
+                break;
+            }
+        }
+        assert!(saw_552, "an oversize message must be refused with 552");
+        assert_eq!(
+            server.store().count("bob@example.com"),
+            0,
+            "the oversize message must not be delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_inbound_rejects_overlong_line() {
+        // A single line longer than MAX_LINE_LENGTH with no newline must be
+        // refused (500) and the connection closed — never buffered unbounded.
+        let server = Arc::new(Server::new(&ServerConfig::new(["example.com".to_string()])));
+        let inbound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = inbound.local_addr().unwrap();
+        {
+            let srv = Arc::clone(&server);
+            tokio::spawn(async move {
+                let (s, _) = inbound.accept().await.unwrap();
+                serve_inbound(s, srv).await.unwrap();
+            });
+        }
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (cr, mut cw) = client.into_split();
+        let mut cr = BufReader::new(cr);
+        assert!(read_line(&mut cr).await.starts_with("220"));
+
+        // One oversize line (no CRLF): MAX_LINE_LENGTH + slack bytes.
+        let blast = vec![b'A'; MAX_LINE_LENGTH + 4096];
+        cw.write_all(&blast).await.unwrap();
+        let reply = read_line(&mut cr).await;
+        assert!(
+            reply.starts_with("500"),
+            "an over-long line must be refused with 500, got {reply:?}"
+        );
     }
 
     #[tokio::test]

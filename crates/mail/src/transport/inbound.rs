@@ -4,6 +4,11 @@
 use crate::error::Result;
 use crate::snailmail::{Envelope, Message};
 
+/// Default maximum accumulated `DATA` body size (25 MiB). A bound is mandatory:
+/// the collector buffers the body in memory, so an uncapped one is a
+/// memory-exhaustion DoS on the unauthenticated inbound port.
+pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 25 * 1024 * 1024;
+
 /// Accumulates the `DATA` body lines of an inbound SMTP transaction.
 #[derive(Debug)]
 pub struct InboundCollector {
@@ -13,23 +18,35 @@ pub struct InboundCollector {
     /// stand in for the CRLF that terminates the `DATA` command itself, so an
     /// immediate `.\r\n` (an empty message) is still a valid terminator.
     prev_crlf: bool,
+    /// Maximum accumulated body size; past this the collector stops growing.
+    max_size: usize,
+    /// Set once the body would exceed `max_size`; the caller then aborts (552).
+    size_exceeded: bool,
 }
 
 impl Default for InboundCollector {
     fn default() -> Self {
-        Self {
-            body: Vec::new(),
-            finished: false,
-            prev_crlf: true,
-        }
+        Self::with_max_size(DEFAULT_MAX_MESSAGE_SIZE)
     }
 }
 
 impl InboundCollector {
-    /// A new, empty collector.
+    /// A new, empty collector with the default size cap.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A new, empty collector with an explicit maximum body size.
+    #[must_use]
+    pub fn with_max_size(max_size: usize) -> Self {
+        Self {
+            body: Vec::new(),
+            finished: false,
+            prev_crlf: true,
+            max_size,
+            size_exceeded: false,
+        }
     }
 
     /// Feed one raw `DATA` line **including its line terminator** as read off the
@@ -63,10 +80,24 @@ impl InboundCollector {
         }
 
         let unstuffed = content.strip_prefix('.').unwrap_or(content);
+        // Enforce the body-size cap: once appending would exceed it, stop growing
+        // and flag it. The caller checks `size_exceeded` and aborts (552) without
+        // buffering the rest — an unbounded body is a memory-exhaustion DoS.
+        if self.size_exceeded || self.body.len() + unstuffed.len() + 2 > self.max_size {
+            self.size_exceeded = true;
+            return false;
+        }
         self.body.extend_from_slice(unstuffed.as_bytes());
         self.body.extend_from_slice(b"\r\n");
         self.prev_crlf = this_crlf;
         false
+    }
+
+    /// Whether the body has exceeded the configured maximum size. When `true` the
+    /// caller must abort the transaction (552) rather than deliver a truncated body.
+    #[must_use]
+    pub fn size_exceeded(&self) -> bool {
+        self.size_exceeded
     }
 
     /// Whether the terminating `.` has been received.
@@ -178,5 +209,28 @@ mod tests {
         let body = String::from_utf8_lossy(&msg.body);
         assert!(body.contains("MAIL FROM:<spoofed@example.com>"), "{body}");
         assert!(body.contains("Injected"), "{body}");
+    }
+
+    #[test]
+    fn body_past_the_cap_is_flagged_and_bounded() {
+        let mut c = InboundCollector::with_max_size(1024);
+        c.push_line("Subject: big\r\n");
+        c.push_line("\r\n");
+        // 200-byte lines: a few stay under, then one crosses the 1 KiB cap.
+        let line = format!("{}\r\n", "x".repeat(200));
+        for _ in 0..20 {
+            if c.push_line(&line) {
+                break;
+            }
+            if c.size_exceeded() {
+                break;
+            }
+        }
+        assert!(c.size_exceeded(), "a body past the cap must be flagged");
+        assert!(
+            c.body.len() <= 1024,
+            "the body must never grow past the cap, got {}",
+            c.body.len()
+        );
     }
 }

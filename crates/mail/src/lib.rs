@@ -22,5 +22,6 @@ pub use snailmail::{
 };
 pub use storage::{DeliveryOutcome, MailDeliveryAgent, MailStore, MemoryMailStore, StoredMessage};
 pub use transport::{
-    InboundCollector, InboundResult, Mta, RelayScript, Route, SmtpCommand, SmtpReply, SmtpSession,
+    DEFAULT_MAX_MESSAGE_SIZE, InboundCollector, InboundResult, Mta, RelayScript, Route,
+    SmtpCommand, SmtpReply, SmtpSession,
 };

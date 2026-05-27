@@ -6,7 +6,7 @@ pub mod mta;
 pub mod outbound;
 pub mod smtp;
 
-pub use inbound::InboundCollector;
+pub use inbound::{DEFAULT_MAX_MESSAGE_SIZE, InboundCollector};
 pub use mta::{InboundResult, Mta, Route};
 pub use outbound::{RelayScript, relay_script};
 pub use smtp::{Phase, SmtpCommand, SmtpReply, SmtpSession};

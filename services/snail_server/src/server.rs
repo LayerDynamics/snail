@@ -8,8 +8,8 @@ use std::sync::Arc;
 use filter::SpamFilter;
 use identity::{Account, Authenticator};
 use mail::{
-    Envelope, Headers, InboundResult, MailCerts, MailDeliveryAgent, Mailbox, MemoryMailStore,
-    Message, Mta,
+    DEFAULT_MAX_MESSAGE_SIZE, Envelope, Headers, InboundResult, MailCerts, MailDeliveryAgent,
+    Mailbox, MemoryMailStore, Message, Mta,
 };
 use network::DnsResolver;
 use security::{
@@ -76,6 +76,7 @@ pub struct Server {
     relay: Option<RelayContext>,
     firewall: Arc<Firewall>,
     auth_throttle: Arc<AuthThrottle>,
+    collector_max_size: usize,
 }
 
 impl Server {
@@ -101,6 +102,7 @@ impl Server {
             relay: None,
             firewall: Arc::new(Firewall::new(&FirewallConfig::default())),
             auth_throttle: Arc::new(AuthThrottle::new(ThrottleConfig::default())),
+            collector_max_size: DEFAULT_MAX_MESSAGE_SIZE,
         }
     }
 
@@ -131,6 +133,21 @@ impl Server {
     #[must_use]
     pub fn auth_throttle(&self) -> &AuthThrottle {
         &self.auth_throttle
+    }
+
+    /// Set the maximum accepted message (`DATA` body) size. Defaults to
+    /// [`mail::DEFAULT_MAX_MESSAGE_SIZE`]; a larger body is refused with `552` and
+    /// the connection closed, so an unauthenticated peer cannot OOM the process.
+    #[must_use]
+    pub fn with_max_message_size(mut self, max_size: usize) -> Self {
+        self.collector_max_size = max_size;
+        self
+    }
+
+    /// The maximum accepted message (`DATA` body) size.
+    #[must_use]
+    pub fn max_message_size(&self) -> usize {
+        self.collector_max_size
     }
 
     /// Enable outbound relay: queue remote mail to `spool` and deliver it by
