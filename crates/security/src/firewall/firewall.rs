@@ -2,6 +2,7 @@
 //! connection tracking, a decision trace, and a pause switch into one gate.
 
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError, RwLock};
 
 use governor::RateLimiter;
@@ -37,6 +38,9 @@ pub enum Decision {
 type KeyedLimiter<C> =
     RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, C, NoOpMiddleware<<C as Clock>::Instant>>;
 
+/// Run rate-limiter housekeeping once every this many `check` calls (amortised).
+const MAINTENANCE_INTERVAL: u64 = 1024;
+
 /// Connection-policy gate for the public-facing server. Generic over the clock
 /// `C` so tests can drive a deterministic `FakeRelativeClock`.
 pub struct Firewall<C: Clock = DefaultClock> {
@@ -46,6 +50,8 @@ pub struct Firewall<C: Clock = DefaultClock> {
     tracker: Mutex<ConnectionTracker>,
     trace: Mutex<DecisionTrace>,
     pause: PauseSwitch,
+    /// `check` call counter driving amortised rate-limiter housekeeping.
+    checks: AtomicU64,
 }
 
 impl Firewall<DefaultClock> {
@@ -77,9 +83,13 @@ impl<C: Clock> Firewall<C> {
             limiter,
             allow: RwLock::new(allow),
             block: RwLock::new(block),
-            tracker: Mutex::new(ConnectionTracker::new()),
+            tracker: Mutex::new(ConnectionTracker::with_limits(
+                config.idle_ttl,
+                config.max_tracked_ips,
+            )),
             trace: Mutex::new(DecisionTrace::new(config.trace_capacity)),
             pause: PauseSwitch::new(),
+            checks: AtomicU64::new(0),
         }
     }
 
@@ -88,6 +98,17 @@ impl<C: Clock> Firewall<C> {
     /// Evaluation order: paused (→ allow) → allowlist (→ allow) → blocklist
     /// (→ deny) → rate limit. Every call is tracked and traced.
     pub fn check(&self, ip: IpAddr) -> Decision {
+        // Amortised housekeeping: periodically evict stale keys from the rate
+        // limiter so a flood of distinct source IPs cannot grow its keyed state
+        // store without bound (the connection tracker self-bounds internally).
+        if self
+            .checks
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(MAINTENANCE_INTERVAL)
+        {
+            self.maintain();
+        }
+
         self.tracker
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -163,6 +184,31 @@ impl<C: Clock> Firewall<C> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .len()
+    }
+
+    /// Evict stale per-IP state from the rate limiter and release freed capacity.
+    /// Runs automatically on a cadence inside [`Self::check`]; exposed so callers
+    /// (and tests) can force a sweep.
+    pub fn maintain(&self) {
+        self.limiter.retain_recent();
+        self.limiter.shrink_to_fit();
+    }
+
+    /// Number of live keys retained by the rate limiter (may be approximate, per
+    /// governor's keyed-store semantics).
+    #[must_use]
+    pub fn limiter_len(&self) -> usize {
+        self.limiter.len()
+    }
+
+    /// Number of distinct IPs the connection tracker currently retains (bounded
+    /// by the configured `max_tracked_ips`).
+    #[must_use]
+    pub fn tracked_ips(&self) -> usize {
+        self.tracker
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .tracked_ips()
     }
 }
 
@@ -245,5 +291,48 @@ mod tests {
         fw.check(ip(3));
         assert_eq!(fw.attempts(&ip(3)), 2);
         assert_eq!(fw.trace_len(), 2);
+    }
+
+    #[test]
+    fn flood_of_distinct_ips_keeps_tracker_bounded() {
+        // The memory-exhaustion DoS: many distinct source IPs. The connection
+        // tracker must stay within its hard cap rather than grow per IP.
+        let cfg = FirewallConfig {
+            max_tracked_ips: 100,
+            ..FirewallConfig::default()
+        };
+        let fw = Firewall::new(&cfg);
+        for n in 0..5000u32 {
+            fw.check(IpAddr::V4(Ipv4Addr::from(n)));
+        }
+        assert!(
+            fw.tracked_ips() <= 100,
+            "tracker must stay within max_tracked_ips, got {}",
+            fw.tracked_ips()
+        );
+    }
+
+    #[test]
+    fn stale_rate_limiter_keys_are_evicted() {
+        // The keyed rate-limiter store must not retain a key per distinct IP
+        // forever: once a key is indistinguishable from fresh, a sweep drops it.
+        let clock = FakeRelativeClock::default();
+        let cfg = FirewallConfig {
+            quota: quota(1),
+            ..FirewallConfig::default()
+        };
+        let fw = Firewall::with_clock(&cfg, clock.clone());
+        for n in 0..50u32 {
+            fw.check(IpAddr::V4(Ipv4Addr::from(n)));
+        }
+        assert!(fw.limiter_len() > 0, "keys present right after the flood");
+        // Advance past the refill window so every single-hit key looks fresh.
+        clock.advance(Duration::from_secs(60));
+        fw.maintain();
+        assert!(
+            fw.limiter_len() < 50,
+            "stale keys must be evicted, got {}",
+            fw.limiter_len()
+        );
     }
 }

@@ -16,7 +16,7 @@ The **entire Rust engine is built, tested, and runs as a full internet MTA** (mi
   - `crates/utilities` — typed `UtilError` + process `Config`.
   - `services/telemetry` — `tracing` + OpenTelemetry pipeline (`init()` → `TelemetryGuard`) + `telemetry selftest` binary.
   - `crates/network` — async DNS (hickory `DnsResolver`, MX lookup) + rustls/rcgen TLS config (m9).
-  - `crates/security` — argon2 `PasswordHasher`, chacha20poly1305 `SecretCipher`, `CredentialStore`, governor `Firewall`, per-IP `AuthThrottle` (brute-force lockout), `AuditLog` (m10).
+  - `crates/security` — argon2 `PasswordHasher`, chacha20poly1305 `SecretCipher`, `CredentialStore`, governor `Firewall` (bounded per-IP state — capped tracker + amortized stale-key eviction, no memory-exhaustion DoS), per-IP `AuthThrottle` (brute-force lockout), `AuditLog` (m10).
   - `crates/identity` — account model, password auth, SASL `PLAIN`/`LOGIN`/`XOAUTH2`, connection state (m11).
   - `crates/mail` — RFC 5322 message model, `MailStore` + in-memory store, MDA delivery, SMTP parser + server session, inbound DATA collection (`InboundCollector` requires a genuine `<CRLF>.<CRLF>` end-of-data and normalises bare newlines — SMTP-smuggling hardened), outbound relay script, `Mta` local/remote routing, content scanner, STARTTLS policy, mail-flow metrics (m12).
   - `crates/access` — POP3, IMAP, MSA submission sessions (each modelling `STLS`/`STARTTLS` + capability advertisement + plaintext-auth refusal until TLS is active; the MSA also binds `MAIL FROM` to the authenticated user per RFC 6409, refusing sender spoofing with `553`), Dovecot Maildir++ mapping, web access, `AccessManager` (m13).
