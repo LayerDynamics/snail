@@ -14,5 +14,7 @@ pub use auth::Authenticator;
 pub use connect::{ConnectionAuth, ConnectionState};
 pub use data::{Account, Identity, Role};
 pub use error::{IdentityError, Result};
-pub use oauth::{StaticTokenValidator, TokenValidator, XOAuth2, parse_xoauth2};
+pub use oauth::{
+    StaticTokenValidator, TokenValidator, XOAuth2, authenticate_xoauth2, parse_xoauth2,
+};
 pub use sals::{SaslCredentials, SaslMechanism, decode_login_field, decode_plain};
