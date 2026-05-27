@@ -20,7 +20,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 use tokio_rustls::server::TlsStream;
 
-use crate::server::Server;
+use crate::server::{RelayAuthorization, Server};
 use crate::worker::spawn_relay_worker;
 
 /// How often the relay worker scans the spool for due messages.
@@ -144,7 +144,9 @@ pub async fn serve_submission(stream: TcpStream, server: Arc<Server>) -> std::io
                 let reply = match msa.smtp_mut().take_envelope() {
                     Some(envelope) => match collector.into_message(envelope) {
                         Ok(message) => {
-                            let _ = server.accept_inbound(message);
+                            // Authenticated submission: relaying to remote
+                            // recipients is permitted.
+                            let _ = server.accept_inbound(message, RelayAuthorization::Permitted);
                             "250 OK message accepted\r\n"
                         }
                         Err(_) => "554 message parse error\r\n",
@@ -267,9 +269,10 @@ pub async fn serve_inbound(stream: TcpStream, server: Arc<Server>) -> std::io::R
                 let reply = match session.take_envelope() {
                     Some(envelope) => match collector.into_message(envelope) {
                         Ok(message) => {
-                            // Recipients were vetted as local at RCPT time, so this
-                            // delivers locally and never relays.
-                            let _ = server.accept_inbound(message);
+                            // No-auth inbound: recipients were vetted as local at
+                            // RCPT time, and relay is forbidden here regardless, so
+                            // this delivers locally and never relays.
+                            let _ = server.accept_inbound(message, RelayAuthorization::Forbidden);
                             "250 OK message accepted\r\n"
                         }
                         Err(_) => "554 message parse error\r\n",

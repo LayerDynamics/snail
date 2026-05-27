@@ -20,6 +20,21 @@ use crate::spool::OutboundSpool;
 /// The default SMTP relay port (production MX delivery target).
 pub const DEFAULT_RELAY_PORT: u16 = 25;
 
+/// Whether a connection is authorized to relay mail to non-local recipients.
+///
+/// This is the enqueue-path half of the open-relay defense (the other half is the
+/// RCPT-time `is_local` check on the inbound listener). Passed explicitly to
+/// [`Server::accept_inbound`] so the relay decision is never implicit: only the
+/// authenticated submission path is [`Permitted`](RelayAuthorization::Permitted);
+/// the no-auth inbound (port 25) path is [`Forbidden`](RelayAuthorization::Forbidden).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayAuthorization {
+    /// Authenticated submission — remote recipients may be spooled for relay.
+    Permitted,
+    /// Unauthenticated inbound — local delivery only, never relay.
+    Forbidden,
+}
+
 /// Everything the relay worker needs to drive outbound delivery: where to look
 /// up MX (`resolver`), the durable queue (`spool`), the EHLO name to announce
 /// (`helo`), the port to connect to on each exchange (`port`), and the client
@@ -186,15 +201,39 @@ impl Server {
     }
 
     /// Accept an inbound message: deliver to local recipients (scanned by the
-    /// spam filter) and, when outbound relay is enabled, queue any remote
-    /// recipients onto the durable spool (grouped per domain, one entry each)
-    /// for the relay worker. Returns the [`InboundResult`] from the MTA.
-    pub fn accept_inbound(&self, message: Message) -> InboundResult {
-        // Only the relay-enabled path needs the message parts cloned for the
-        // spool; a local-only server avoids the copy entirely.
-        let Some(relay) = self.relay.as_ref() else {
-            return self.mta.accept_inbound(message);
+    /// spam filter) and, when outbound relay is enabled **and** the connection is
+    /// authorized to relay, queue any remote recipients onto the durable spool
+    /// (grouped per domain, one entry each) for the relay worker. Returns the
+    /// [`InboundResult`] from the MTA.
+    ///
+    /// `authorization` is the second, independent open-relay gate: only the
+    /// authenticated submission path passes [`RelayAuthorization::Permitted`]. The
+    /// no-auth inbound (port 25) listener passes [`RelayAuthorization::Forbidden`],
+    /// so a non-local recipient is **never** spooled there — even if one were to
+    /// slip past the RCPT-time `is_local` guard, Snail still cannot become an open
+    /// relay. A forbidden remote recipient is dropped (not relayed) and logged.
+    pub fn accept_inbound(
+        &self,
+        message: Message,
+        authorization: RelayAuthorization,
+    ) -> InboundResult {
+        let permitted = authorization == RelayAuthorization::Permitted;
+        // Relay only when outbound relay is configured AND this connection is
+        // authorized to relay; otherwise deliver locally only.
+        let Some(relay) = self.relay.as_ref().filter(|_| permitted) else {
+            let result = self.mta.accept_inbound(message);
+            if !permitted && !result.relay.is_empty() {
+                // A non-local recipient reached the no-relay path. The RCPT-time
+                // guard should have refused it; surface that it did not, and do
+                // not relay it.
+                tracing::warn!(
+                    count = result.relay.len(),
+                    "non-local recipient on a relay-forbidden connection was not relayed (open-relay guard)"
+                );
+            }
+            return result;
         };
+        // Only the relay-enabled path needs the message parts cloned for the spool.
         let sender = message.envelope.sender.clone();
         let headers = message.headers.clone();
         let body = message.body.clone();
@@ -216,6 +255,12 @@ impl Server {
 /// copy of the message restricted to that domain's recipients) for the relay
 /// worker. One entry per domain keeps each queued message single-MX, so retries
 /// never re-deliver to an already-accepted domain.
+///
+/// # Invariant
+/// Must only be called for [`RelayAuthorization::Permitted`] connections.
+/// [`Server::accept_inbound`] is the sole caller and gates on that; do not call
+/// this from any path that has not established relay authorization, or Snail
+/// becomes an open relay.
 fn enqueue_relay(
     relay: &RelayContext,
     sender: &Option<Mailbox>,
@@ -266,12 +311,15 @@ mod tests {
         server.register_user("bob@example.com", "s3cret").unwrap();
 
         // A remote sender delivers to local bob@example.com.
-        let result = server.accept_inbound(inbound(
-            "alice@remote.net",
-            "bob@example.com",
-            "Hi Bob",
-            "hello from alice",
-        ));
+        let result = server.accept_inbound(
+            inbound(
+                "alice@remote.net",
+                "bob@example.com",
+                "Hi Bob",
+                "hello from alice",
+            ),
+            RelayAuthorization::Permitted,
+        );
         assert!(matches!(
             result.local,
             Some(DeliveryOutcome::Delivered { recipients: 1, .. })
@@ -291,15 +339,82 @@ mod tests {
     #[test]
     fn remote_recipient_is_routed_to_relay_not_stored() {
         let server = Server::new(&ServerConfig::new(["example.com".to_string()]));
-        let result = server.accept_inbound(inbound(
-            "alice@example.com",
-            "carol@elsewhere.org",
-            "hi",
-            "x",
-        ));
+        let result = server.accept_inbound(
+            inbound("alice@example.com", "carol@elsewhere.org", "hi", "x"),
+            RelayAuthorization::Permitted,
+        );
         assert!(result.local.is_none());
         assert_eq!(result.relay.len(), 1);
         assert_eq!(result.relay[0].to_string(), "carol@elsewhere.org");
+    }
+
+    /// A resolver stub: relay enqueueing needs a relay context, but the enqueue
+    /// path never calls the resolver (only the worker does).
+    struct DummyResolver;
+
+    #[async_trait::async_trait]
+    impl network::DnsResolver for DummyResolver {
+        async fn lookup_mx(&self, _domain: &str) -> network::Result<Vec<network::MxRecord>> {
+            Ok(Vec::new())
+        }
+        async fn lookup_ip(&self, _host: &str) -> network::Result<Vec<network::AddressRecord>> {
+            Ok(Vec::new())
+        }
+        async fn lookup_txt(&self, _name: &str) -> network::Result<Vec<network::TxtRecord>> {
+            Ok(Vec::new())
+        }
+        async fn reverse_lookup(
+            &self,
+            _ip: std::net::IpAddr,
+        ) -> network::Result<Vec<network::PtrRecord>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn forbidden_never_spools_remote_recipient_even_when_relay_is_configured() {
+        use crate::spool::OutboundSpool;
+        use std::sync::Arc;
+        use std::time::{Duration, SystemTime};
+
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("snail-relayauth-{nanos}"));
+        let spool = Arc::new(OutboundSpool::open(&dir).unwrap());
+        let server = Server::new(&ServerConfig::new(["example.com".to_string()]))
+            .with_relay(Arc::new(DummyResolver), Arc::clone(&spool));
+        let not_empty =
+            |after: Duration| !spool.due_now(SystemTime::now() + after).unwrap().is_empty();
+
+        // Forbidden (no-auth inbound): the MTA still classifies the recipient as
+        // remote, but it MUST NOT be spooled — Snail is never an open relay.
+        let result = server.accept_inbound(
+            inbound("attacker@evil.test", "victim@elsewhere.org", "hi", "x"),
+            RelayAuthorization::Forbidden,
+        );
+        assert_eq!(
+            result.relay.len(),
+            1,
+            "recipient is routed remote by the MTA"
+        );
+        assert!(
+            !not_empty(Duration::from_secs(1)),
+            "a relay-forbidden connection must never spool a remote recipient"
+        );
+
+        // Permitted (authenticated submission): the same kind of recipient IS spooled.
+        server.accept_inbound(
+            inbound("alice@example.com", "carol@elsewhere.org", "hi", "x"),
+            RelayAuthorization::Permitted,
+        );
+        assert!(
+            not_empty(Duration::from_secs(1)),
+            "an authorized submission must spool the remote recipient"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
