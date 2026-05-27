@@ -19,7 +19,9 @@ use std::sync::Arc;
 
 use mail::MailCerts;
 use network::HickoryResolver;
-use snail_server::{Listeners, OutboundSpool, Server, ServerConfig, install_crypto_provider, run};
+use snail_server::{
+    ConcurrencyLimits, Listeners, OutboundSpool, Server, ServerConfig, install_crypto_provider, run,
+};
 use telemetry::TelemetryConfig;
 
 #[tokio::main]
@@ -70,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
         pop3: env_or("SNAIL_POP3_ADDR", "127.0.0.1:110"),
         imap: env_or("SNAIL_IMAP_ADDR", "127.0.0.1:143"),
         inbound: env_or("SNAIL_INBOUND_ADDR", "127.0.0.1:2525"),
+        limits: ConcurrencyLimits::default(),
     };
 
     run(server, &listeners).await?;

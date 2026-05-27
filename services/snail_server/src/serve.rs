@@ -15,9 +15,11 @@ use access::{
 };
 use mail::{InboundCollector, SmtpCommand, SmtpSession};
 use security::Decision;
+use std::future::Future;
+
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 use tokio_rustls::server::TlsStream;
 
 use crate::server::{RelayAuthorization, Server};
@@ -81,7 +83,37 @@ async fn read_line_capped<R: AsyncBufReadExt + Unpin>(
     }
 }
 
-/// Bind addresses for the protocol listeners.
+/// Per-listener cap on concurrently-served connections. Each listener has its own
+/// budget so a flood on the unauthenticated inbound port cannot starve the
+/// authenticated submission/POP3/IMAP listeners (a single global cap could).
+/// Tune down on memory-constrained hosts; `0` effectively disables a listener.
+#[derive(Debug, Clone, Copy)]
+pub struct ConcurrencyLimits {
+    /// Max concurrent submission connections.
+    pub submission: usize,
+    /// Max concurrent POP3 connections.
+    pub pop3: usize,
+    /// Max concurrent IMAP connections.
+    pub imap: usize,
+    /// Max concurrent inbound-MX connections (the unauthenticated public port).
+    pub inbound: usize,
+}
+
+impl Default for ConcurrencyLimits {
+    fn default() -> Self {
+        // Authenticated ports: generous for a personal server. Inbound (public,
+        // unauthenticated): a larger budget so legit MX-to-MX exchanges are not
+        // squeezed, but still bounded.
+        Self {
+            submission: 256,
+            pop3: 256,
+            imap: 256,
+            inbound: 512,
+        }
+    }
+}
+
+/// Bind addresses for the protocol listeners, plus their concurrency caps.
 #[derive(Debug, Clone)]
 pub struct Listeners {
     /// Authenticated submission (SMTP+AUTH), e.g. `127.0.0.1:587`.
@@ -92,6 +124,8 @@ pub struct Listeners {
     pub imap: String,
     /// Inbound MX reception (no-auth SMTP), e.g. `127.0.0.1:25` (`:2525` in dev).
     pub inbound: String,
+    /// Per-listener concurrent-connection caps.
+    pub limits: ConcurrencyLimits,
 }
 
 /// Bind all listeners and serve connections until Ctrl-C, spawning a task per
@@ -123,20 +157,53 @@ pub async fn run(server: Arc<Server>, listeners: &Listeners) -> std::io::Result<
         )
     });
 
-    loop {
-        tokio::select! {
-            Ok((stream, peer)) = submission.accept() => spawn(serve_submission(stream, peer, Arc::clone(&server))),
-            Ok((stream, peer)) = pop3.accept() => spawn(serve_pop(stream, peer, Arc::clone(&server))),
-            Ok((stream, peer)) = imap.accept() => spawn(serve_imap(stream, peer, Arc::clone(&server))),
-            Ok((stream, peer)) = inbound.accept() => spawn(serve_inbound_firewalled(stream, peer, Arc::clone(&server))),
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("shutdown signal received");
-                break;
-            }
-        }
-    }
+    // One bounded accept loop per listener (each with its own concurrency budget),
+    // so the public inbound port cannot exhaust tasks/sockets nor starve the
+    // authenticated listeners.
+    let limits = listeners.limits;
+    let loops = [
+        tokio::spawn(accept_loop(
+            "submission",
+            submission,
+            Arc::new(Semaphore::new(limits.submission)),
+            Arc::clone(&server),
+            serve_submission,
+        )),
+        tokio::spawn(accept_loop(
+            "pop3",
+            pop3,
+            Arc::new(Semaphore::new(limits.pop3)),
+            Arc::clone(&server),
+            serve_pop,
+        )),
+        tokio::spawn(accept_loop(
+            "imap",
+            imap,
+            Arc::new(Semaphore::new(limits.imap)),
+            Arc::clone(&server),
+            serve_imap,
+        )),
+        tokio::spawn(accept_loop(
+            "inbound",
+            inbound,
+            Arc::new(Semaphore::new(limits.inbound)),
+            Arc::clone(&server),
+            serve_inbound_firewalled,
+        )),
+    ];
 
-    // Stop the relay worker and wait for it to finish its current tick.
+    tokio::signal::ctrl_c().await?;
+    tracing::info!("shutdown signal received");
+
+    // Stop accepting (abort is race-free; in-flight connection handlers are
+    // independent tasks and finish or are dropped on process exit), then stop the
+    // relay worker and let it finish its current tick.
+    for handle in &loops {
+        handle.abort();
+    }
+    for handle in loops {
+        let _ = handle.await;
+    }
     shutdown.notify_one();
     if let Some(worker) = worker {
         let _ = worker.await;
@@ -144,12 +211,40 @@ pub async fn run(server: Arc<Server>, listeners: &Listeners) -> std::io::Result<
     Ok(())
 }
 
-fn spawn(fut: impl std::future::Future<Output = std::io::Result<()>> + Send + 'static) {
-    tokio::spawn(async move {
-        if let Err(error) = fut.await {
-            tracing::warn!(%error, "connection handler ended with error");
-        }
-    });
+/// Accept connections on `listener` forever, serving each with `handler`, but
+/// never more than the `sem` budget concurrently. A permit is acquired **before**
+/// `accept` — at the cap the loop stalls here and stops accepting, so excess
+/// connections back up in the OS queue (true backpressure) rather than spawning
+/// unbounded tasks. The permit is held for the connection's lifetime.
+async fn accept_loop<H, F>(
+    name: &'static str,
+    listener: TcpListener,
+    sem: Arc<Semaphore>,
+    server: Arc<Server>,
+    handler: H,
+) where
+    H: Fn(TcpStream, SocketAddr, Arc<Server>) -> F + Send + 'static,
+    F: Future<Output = std::io::Result<()>> + Send + 'static,
+{
+    loop {
+        let Ok(permit) = Arc::clone(&sem).acquire_owned().await else {
+            break; // semaphore closed
+        };
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                tracing::warn!(listener = name, %error, "accept failed");
+                continue;
+            }
+        };
+        let fut = handler(stream, peer, Arc::clone(&server));
+        tokio::spawn(async move {
+            let _permit = permit; // released when the connection handler ends
+            if let Err(error) = fut.await {
+                tracing::warn!(listener = name, %error, "connection handler ended with error");
+            }
+        });
+    }
 }
 
 /// Firewall-gated entry to the public inbound port: rate-limited or blocklisted
@@ -1442,5 +1537,58 @@ mod tests {
             locked.starts_with("-ERR") && locked.contains("too many"),
             "expected a lockout reply, got {locked:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn accept_loop_caps_concurrent_connections() {
+        use tokio::time::{Duration, timeout};
+
+        let server = Arc::new(Server::new(&ServerConfig::new(["example.com".to_string()])));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // A budget of 2 concurrent connections.
+        let handle = tokio::spawn(accept_loop(
+            "submission",
+            listener,
+            Arc::new(Semaphore::new(2)),
+            Arc::clone(&server),
+            serve_submission,
+        ));
+
+        // Two connections take both permits; each handler greets then blocks in
+        // read_line awaiting a command we never send — so both permits stay held.
+        let hold1 = TcpStream::connect(addr).await.unwrap();
+        let (h1r, h1w) = hold1.into_split();
+        let mut h1r = BufReader::new(h1r);
+        assert!(read_line(&mut h1r).await.starts_with("220"));
+        let hold2 = TcpStream::connect(addr).await.unwrap();
+        let (h2r, _h2w) = hold2.into_split();
+        let mut h2r = BufReader::new(h2r);
+        assert!(read_line(&mut h2r).await.starts_with("220"));
+
+        // A third connection: the OS completes the handshake, but the loop is
+        // stalled on acquire_owned (no permit) and never calls accept, so no
+        // handler runs and no greeting arrives.
+        let third = TcpStream::connect(addr).await.unwrap();
+        let (t3r, _t3w) = third.into_split();
+        let mut t3r = BufReader::new(t3r);
+        assert!(
+            timeout(Duration::from_millis(300), read_line(&mut t3r))
+                .await
+                .is_err(),
+            "the third connection must not be served while the cap is full"
+        );
+
+        // Free a permit: dropping the first connection makes its handler see EOF
+        // and end, releasing its permit → the loop accepts the third → it greets.
+        drop(h1r);
+        drop(h1w);
+        let greeting = timeout(Duration::from_secs(2), read_line(&mut t3r)).await;
+        assert!(
+            matches!(&greeting, Ok(g) if g.starts_with("220")),
+            "the third connection should be served once a permit frees, got {greeting:?}"
+        );
+
+        handle.abort();
     }
 }
