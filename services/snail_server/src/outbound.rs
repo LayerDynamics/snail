@@ -340,11 +340,27 @@ pub async fn relay(
         }
     };
 
+    // RFC 7505 null MX: a `0 .` record means the domain explicitly accepts no
+    // mail. That is a permanent condition — bounce immediately rather than
+    // connecting to an empty exchange (`:25`) and retrying until the queue gives
+    // up. (A null MX must be the sole record, so "all null" captures it.)
+    if exchanges.iter().all(MxRecord::is_null) {
+        return RelayReport::Failed {
+            reason: format!("{domain} does not accept mail (null MX, RFC 7505)"),
+        };
+    }
+
     let mut last = RelayReport::Deferred {
         code: 0,
         text: format!("no usable MX for {domain}"),
     };
     for mx in &exchanges {
+        // Defensive: never connect to an empty exchange (`:25`). A lone null MX
+        // was already handled above; this skips a null mixed in with real records
+        // (a misconfiguration) so we still try the deliverable hosts.
+        if mx.is_null() {
+            continue;
+        }
         let addr = format!("{}:{}", mx.exchange, port);
         match relay_to(&addr, &mx.exchange, helo, message, tls).await {
             Ok(RelayReport::Delivered) => return RelayReport::Delivered,
@@ -697,6 +713,43 @@ mod tests {
         assert!(
             matches!(report, RelayReport::Deferred { .. }),
             "a failed STARTTLS handshake must defer, got {report:?}"
+        );
+    }
+
+    /// A resolver that publishes only an RFC 7505 null MX (`0 .`, which the
+    /// network layer maps to an empty exchange).
+    struct NullMxResolver;
+
+    #[async_trait::async_trait]
+    impl network::DnsResolver for NullMxResolver {
+        async fn lookup_mx(&self, _domain: &str) -> network::Result<Vec<MxRecord>> {
+            Ok(vec![MxRecord {
+                preference: 0,
+                exchange: String::new(),
+            }])
+        }
+        async fn lookup_ip(&self, _host: &str) -> network::Result<Vec<network::AddressRecord>> {
+            Ok(Vec::new())
+        }
+        async fn lookup_txt(&self, _name: &str) -> network::Result<Vec<network::TxtRecord>> {
+            Ok(Vec::new())
+        }
+        async fn reverse_lookup(
+            &self,
+            _ip: std::net::IpAddr,
+        ) -> network::Result<Vec<network::PtrRecord>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_bounces_permanently_on_null_mx() {
+        // A null MX means the domain accepts no mail — a permanent failure, so the
+        // worker bounces immediately instead of connecting to ":25" and retrying.
+        let report = relay(&NullMxResolver, "relay.example.com", 25, &message(), None).await;
+        assert!(
+            matches!(report, RelayReport::Failed { .. }),
+            "a null MX must be a permanent failure, got {report:?}"
         );
     }
 
