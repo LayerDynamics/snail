@@ -54,6 +54,35 @@ impl TlsConfig {
         Ok(Arc::new(config))
     }
 
+    /// Build a client [`ClientConfig`] that authenticates the peer against the
+    /// **Mozilla PKIX trust anchors** (`webpki-roots`), with full WebPKI chain +
+    /// hostname verification.
+    ///
+    /// This is the config to use whenever the peer's identity *must* be proven:
+    /// fetching an MTA-STS policy over HTTPS (RFC 8461 §3.3 requires a valid
+    /// PKIX certificate for `mta-sts.<domain>`), and relaying to a mail exchange
+    /// under an MTA-STS `enforce` policy (RFC 8461 §4.1 — the certificate must
+    /// chain to a trusted root and match the MX hostname). Unlike
+    /// [`Self::opportunistic_client`], a certificate that does not validate
+    /// causes the handshake to fail rather than be accepted.
+    ///
+    /// # Errors
+    /// Infallible in practice; returns [`NetworkError::Tls`] only if the bundled
+    /// trust anchor set is somehow unusable.
+    pub fn pkix_client() -> Result<Arc<ClientConfig>> {
+        let mut roots = RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        if roots.is_empty() {
+            return Err(NetworkError::Tls(
+                "no PKIX trust anchors available from webpki-roots".into(),
+            ));
+        }
+        let config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        Ok(Arc::new(config))
+    }
+
     /// Build a client [`ClientConfig`] for **opportunistic** outbound SMTP TLS.
     ///
     /// The returned config encrypts the connection but does **not** authenticate

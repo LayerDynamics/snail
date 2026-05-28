@@ -11,7 +11,7 @@ use mail::{
     DEFAULT_MAX_MESSAGE_SIZE, Envelope, InboundResult, MailCerts, MailDeliveryAgent, Mailbox,
     MemoryMailStore, Message, Mta,
 };
-use network::DnsResolver;
+use network::{DnsResolver, MtaStsResolver};
 use security::{
     AuthThrottle, Credential, CredentialStore, Firewall, FirewallConfig, Greylist, GreylistConfig,
     MemoryCredentialStore, ThrottleConfig,
@@ -93,6 +93,10 @@ pub struct Server {
     /// Optional greylisting on the no-auth inbound port (off by default): defers
     /// the first delivery for an unseen `(network, sender, recipient)` triplet.
     greylist: Option<Arc<Greylist>>,
+    /// Optional MTA-STS policy resolver (RFC 8461) for outbound relay (off by
+    /// default): in `enforce` mode it restricts which MX are used and mandates a
+    /// PKIX-validated TLS connection with no cleartext fallback.
+    mta_sts: Option<Arc<MtaStsResolver>>,
 }
 
 impl Server {
@@ -124,6 +128,7 @@ impl Server {
             dmarc_enforce: false,
             dmarc_aggregator: Arc::new(crate::dmarc_report::DmarcAggregator::new()),
             greylist: None,
+            mta_sts: None,
         }
     }
 
@@ -263,6 +268,24 @@ impl Server {
     #[must_use]
     pub fn greylist(&self) -> Option<&Greylist> {
         self.greylist.as_deref()
+    }
+
+    /// Enable MTA-STS (RFC 8461) for outbound relay over `resolver` (off by
+    /// default). When a recipient domain publishes an `enforce` policy, the relay
+    /// uses only policy-matched MX and requires a PKIX-validated TLS connection to
+    /// them — no cleartext fallback.
+    ///
+    /// # Errors
+    /// [`network::NetworkError::Tls`] if the PKIX trust anchors cannot be built.
+    pub fn with_mta_sts(mut self, resolver: Arc<dyn DnsResolver>) -> network::Result<Self> {
+        self.mta_sts = Some(Arc::new(MtaStsResolver::new(resolver)?));
+        Ok(self)
+    }
+
+    /// The MTA-STS policy resolver, if enabled.
+    #[must_use]
+    pub fn mta_sts(&self) -> Option<&MtaStsResolver> {
+        self.mta_sts.as_deref()
     }
 
     /// Override the relay connection port (no-op if relay is not enabled).

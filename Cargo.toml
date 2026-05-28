@@ -60,6 +60,9 @@ ed25519-dalek = "2"
 psl = "2"
 # gzip compression for DMARC aggregate (rua) reports (RFC 7489 §7.2.1.1).
 flate2 = "1"
+# PKIX trust anchors for MTA-STS (RFC 8461): HTTPS policy fetch + enforced
+# outbound TLS certificate verification.
+webpki-roots = "0.26"
 
 # Identity / auth (m11)
 base64 = "0.22"

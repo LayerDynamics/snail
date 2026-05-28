@@ -11,7 +11,7 @@ use std::task::{Context, Poll};
 
 use mail::Message;
 use mail::transport::relay_script;
-use network::{DnsResolver, MxRecord};
+use network::{DnsResolver, MtaStsMode, MtaStsPolicy, MtaStsResolver, MxRecord};
 use rustls::ClientConfig;
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf,
@@ -36,6 +36,41 @@ pub enum RelayReport {
         /// Why the attempt permanently failed.
         reason: String,
     },
+}
+
+/// The TLS posture for a single relay attempt to one mail exchange.
+///
+/// This is the per-exchange decision the relay makes after consulting any
+/// MTA-STS policy (RFC 8461): an `enforce` policy yields [`TlsPolicy::Strict`]
+/// for a policy-matched MX, everything else yields [`TlsPolicy::Opportunistic`]
+/// (or [`TlsPolicy::None`] when no client config is available).
+#[derive(Clone)]
+pub enum TlsPolicy {
+    /// No outbound TLS: deliver in plaintext (no client config was built).
+    None,
+    /// Encrypt if the exchange advertises `STARTTLS`, accepting any certificate;
+    /// otherwise deliver in cleartext (RFC 3207). Standard MTA-to-MTA behaviour.
+    Opportunistic(Arc<ClientConfig>),
+    /// MTA-STS `enforce` (RFC 8461 §4.1): `STARTTLS` is mandatory and the
+    /// certificate MUST validate against PKIX for the MX hostname. There is **no**
+    /// cleartext fallback — a missing `STARTTLS` or a failed/invalid handshake
+    /// defers the message rather than downgrading.
+    Strict(Arc<ClientConfig>),
+}
+
+impl TlsPolicy {
+    /// The client config to use for a STARTTLS upgrade, if any.
+    fn config(&self) -> Option<&Arc<ClientConfig>> {
+        match self {
+            TlsPolicy::None => None,
+            TlsPolicy::Opportunistic(c) | TlsPolicy::Strict(c) => Some(c),
+        }
+    }
+
+    /// Whether TLS is mandatory (no cleartext fallback is permitted).
+    fn is_mandatory(&self) -> bool {
+        matches!(self, TlsPolicy::Strict(_))
+    }
 }
 
 /// Read one SMTP reply, which may span several lines.
@@ -168,11 +203,17 @@ where
 }
 
 /// Relay `message` to a single server at `addr` (`host:port`), announcing
-/// ourselves as `helo`. When `tls` is `Some` and the server advertises
-/// `STARTTLS`, the connection is opportunistically upgraded to TLS (using
-/// `server_name` for the handshake) before the mail transaction; otherwise the
-/// transaction runs in plaintext, as it must against a server that offers no
-/// encryption.
+/// ourselves as `helo`, under the given TLS `policy`.
+///
+/// - [`TlsPolicy::Opportunistic`]: if the server advertises `STARTTLS`, upgrade
+///   to TLS (using `server_name` for the handshake) before the mail transaction;
+///   otherwise the transaction runs in plaintext, as it must against a server
+///   that offers no encryption.
+/// - [`TlsPolicy::Strict`] (MTA-STS `enforce`): `STARTTLS` is mandatory and the
+///   certificate is PKIX-validated against `server_name`; a server that does not
+///   offer `STARTTLS`, or whose handshake fails, is **deferred** with no cleartext
+///   fallback.
+/// - [`TlsPolicy::None`]: always plaintext.
 ///
 /// Connection failures become [`RelayReport::Deferred`] so the caller can retry;
 /// genuine socket errors after connect propagate.
@@ -184,7 +225,7 @@ pub async fn relay_to(
     server_name: &str,
     helo: &str,
     message: &Message,
-    tls: Option<&Arc<ClientConfig>>,
+    policy: &TlsPolicy,
 ) -> std::io::Result<RelayReport> {
     let script = relay_script(helo, message);
     let ehlo = &script.commands[0];
@@ -215,13 +256,24 @@ pub async fn relay_to(
         ));
     }
 
-    // Opportunistic STARTTLS: if we have a client config and the server offered
+    // Under an MTA-STS enforce policy, STARTTLS is mandatory: an exchange that
+    // does not advertise it cannot be delivered to in cleartext (RFC 8461 §4.1).
+    // Defer so the worker retries (the policy host may be transiently misconfigured).
+    if policy.is_mandatory() && !advertises_starttls(&capabilities) {
+        return Ok(RelayReport::Deferred {
+            code: 0,
+            text: format!("MTA-STS enforce: {server_name} does not advertise STARTTLS"),
+        });
+    }
+
+    // STARTTLS upgrade: if we have a client config and the server offered
     // STARTTLS, upgrade and re-issue EHLO over the encrypted channel (RFC 3207
     // §4.2). A failure to negotiate the TLS the server *advertised* is transient
     // (Deferred); we never silently continue in cleartext after offering to
     // encrypt, which would let an active attacker strip encryption (RFC 3207
-    // §4.1).
-    if let Some(config) = tls
+    // §4.1). Under Strict the client config is PKIX-verifying, so an invalid or
+    // mismatched certificate fails the handshake and likewise defers.
+    if let Some(config) = policy.config()
         && advertises_starttls(&capabilities)
     {
         let (code, text) = command(&mut conn, "STARTTLS").await?;
@@ -307,12 +359,19 @@ pub async fn relay_to(
 ///
 /// `tls`, when set, enables opportunistic STARTTLS per exchange (the exchange
 /// hostname is used as the TLS server name); see [`relay_to`].
+///
+/// `mta_sts`, when set, enables RFC 8461 MTA-STS: the recipient domain's policy
+/// is resolved and, in `enforce` mode, only policy-matched exchanges are tried
+/// and each is delivered to under [`TlsPolicy::Strict`] (PKIX-validated TLS, no
+/// cleartext fallback). With no policy (or `none`/`testing` mode) the relay falls
+/// back to the opportunistic `tls` behaviour.
 pub async fn relay(
     resolver: &dyn DnsResolver,
     helo: &str,
     port: u16,
     message: &Message,
     tls: Option<&Arc<ClientConfig>>,
+    mta_sts: Option<&MtaStsResolver>,
 ) -> RelayReport {
     let Some(domain) = message
         .envelope
@@ -353,10 +412,22 @@ pub async fn relay(
         };
     }
 
+    // Resolve any MTA-STS policy for the recipient domain. In `enforce` mode it
+    // both constrains which exchanges are usable and mandates PKIX TLS to them.
+    let sts_policy = match mta_sts {
+        Some(sts) => sts.policy_for(&domain).await,
+        None => None,
+    };
+    let enforce = sts_policy
+        .as_ref()
+        .is_some_and(|p| p.mode == MtaStsMode::Enforce);
+    let pkix = mta_sts.map(MtaStsResolver::pkix_config);
+
     let mut last = RelayReport::Deferred {
         code: 0,
         text: format!("no usable MX for {domain}"),
     };
+    let mut attempted = false;
     for mx in &exchanges {
         // Defensive: never connect to an empty exchange (`:25`). A lone null MX
         // was already handled above; this skips a null mixed in with real records
@@ -364,6 +435,14 @@ pub async fn relay(
         if mx.is_null() {
             continue;
         }
+        // Per-exchange TLS posture. Under MTA-STS enforce an unauthorized MX is
+        // skipped entirely (RFC 8461 §4.1); an authorized one is delivered to
+        // under Strict (PKIX, mandatory); otherwise opportunistic (or none).
+        let Some(tls_policy) = exchange_tls_policy(sts_policy.as_ref(), pkix, &mx.exchange, tls)
+        else {
+            continue;
+        };
+        attempted = true;
         // Resolve the exchange to address(es) through the same (hickory) resolver
         // rather than letting the OS resolver do the final hop at connect time.
         // An address-literal exchange is used directly; the hostname is still used
@@ -377,7 +456,7 @@ pub async fn relay(
         };
         for ip in addresses {
             let addr = SocketAddr::new(ip, port).to_string();
-            match relay_to(&addr, &mx.exchange, helo, message, tls).await {
+            match relay_to(&addr, &mx.exchange, helo, message, &tls_policy).await {
                 Ok(RelayReport::Delivered) => return RelayReport::Delivered,
                 Ok(failed @ RelayReport::Failed { .. }) => return failed, // permanent; stop
                 Ok(deferred) => last = deferred, // try the next address / MX
@@ -390,7 +469,43 @@ pub async fn relay(
             }
         }
     }
+
+    // Under enforce, if no MX was authorized by the policy, the domain's
+    // published MX disagree with its own policy — a transient misconfiguration,
+    // so defer (RFC 8461 §5) rather than bounce.
+    if enforce && !attempted {
+        return RelayReport::Deferred {
+            code: 0,
+            text: format!("no MX for {domain} matches its MTA-STS policy"),
+        };
+    }
     last
+}
+
+/// Decide the per-exchange [`TlsPolicy`] under an optional MTA-STS policy.
+///
+/// Returns `None` to signal the exchange must be **skipped** — only under an
+/// `enforce` policy whose `mx` patterns do not authorize `mx_host`, or when an
+/// `enforce` policy is in force but no PKIX config is available to satisfy it
+/// (skip rather than downgrade to cleartext). Otherwise:
+/// - `enforce` + authorized MX → [`TlsPolicy::Strict`] (mandatory, PKIX TLS);
+/// - any other case (`testing` / `none` / no policy) → the opportunistic config
+///   when one is available, else [`TlsPolicy::None`].
+fn exchange_tls_policy(
+    sts: Option<&MtaStsPolicy>,
+    pkix: Option<&Arc<ClientConfig>>,
+    mx_host: &str,
+    opportunistic: Option<&Arc<ClientConfig>>,
+) -> Option<TlsPolicy> {
+    if let Some(policy) = sts
+        && policy.mode == MtaStsMode::Enforce
+    {
+        if !policy.allows_mx(mx_host) {
+            return None;
+        }
+        return pkix.map(|c| TlsPolicy::Strict(Arc::clone(c)));
+    }
+    Some(opportunistic.map_or(TlsPolicy::None, |c| TlsPolicy::Opportunistic(Arc::clone(c))))
 }
 
 /// Resolve an MX exchange to its IP address(es) via `resolver`. An address-literal
@@ -502,9 +617,15 @@ mod tests {
 
         // No client TLS config: even though the stub advertises STARTTLS, the
         // relay stays in plaintext (this exercises the non-TLS path).
-        let report = relay_to(&addr, "stub.test", "relay.example.com", &message(), None)
-            .await
-            .unwrap();
+        let report = relay_to(
+            &addr,
+            "stub.test",
+            "relay.example.com",
+            &message(),
+            &TlsPolicy::None,
+        )
+        .await
+        .unwrap();
         assert_eq!(report, RelayReport::Delivered);
 
         let body = server.await.unwrap();
@@ -519,7 +640,9 @@ mod tests {
             let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
             l.local_addr().unwrap().to_string()
         };
-        let report = relay_to(&addr, "h", "h", &message(), None).await.unwrap();
+        let report = relay_to(&addr, "h", "h", &message(), &TlsPolicy::None)
+            .await
+            .unwrap();
         assert!(matches!(report, RelayReport::Deferred { code: 0, .. }));
     }
 
@@ -689,7 +812,7 @@ mod tests {
             "127.0.0.1",
             "relay.example.com",
             &message(),
-            Some(&tls),
+            &TlsPolicy::Opportunistic(tls),
         )
         .await
         .unwrap();
@@ -715,7 +838,7 @@ mod tests {
             "127.0.0.1",
             "relay.example.com",
             &message(),
-            Some(&tls),
+            &TlsPolicy::Opportunistic(tls),
         )
         .await
         .unwrap();
@@ -739,7 +862,7 @@ mod tests {
             "mx.invalid",
             "relay.example.com",
             &message(),
-            Some(&tls),
+            &TlsPolicy::Opportunistic(tls),
         )
         .await
         .unwrap();
@@ -779,7 +902,15 @@ mod tests {
     async fn relay_bounces_permanently_on_null_mx() {
         // A null MX means the domain accepts no mail — a permanent failure, so the
         // worker bounces immediately instead of connecting to ":25" and retrying.
-        let report = relay(&NullMxResolver, "relay.example.com", 25, &message(), None).await;
+        let report = relay(
+            &NullMxResolver,
+            "relay.example.com",
+            25,
+            &message(),
+            None,
+            None,
+        )
+        .await;
         assert!(
             matches!(report, RelayReport::Failed { .. }),
             "a null MX must be a permanent failure, got {report:?}"
@@ -831,6 +962,7 @@ mod tests {
             port,
             &message(),
             None,
+            None,
         )
         .await;
         assert_eq!(report, RelayReport::Delivered);
@@ -864,7 +996,7 @@ mod tests {
                 Ok(Vec::new())
             }
         }
-        let report = relay(&NoAddr, "relay.example.com", 25, &message(), None).await;
+        let report = relay(&NoAddr, "relay.example.com", 25, &message(), None, None).await;
         assert!(
             matches!(report, RelayReport::Deferred { .. }),
             "an MX with no address is transient, got {report:?}"
@@ -886,10 +1018,120 @@ mod tests {
             b"Subject: probe\r\n\r\nignored",
         )
         .unwrap();
-        let report = relay(&resolver, "snail.invalid", 25, &probe, None).await;
+        let report = relay(&resolver, "snail.invalid", 25, &probe, None, None).await;
         assert!(
             !matches!(report, RelayReport::Delivered),
             "example.com must not accept mail, got {report:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_policy_defers_when_starttls_not_offered() {
+        // The security property of MTA-STS `enforce`: a server that does NOT
+        // advertise STARTTLS must be DEFERRED, never delivered to in cleartext.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        // Spawn (and abandon) the plaintext receiver: the relay never reaches DATA.
+        tokio::spawn(plain_no_tls_receiver(listener));
+
+        let pkix = network::TlsConfig::pkix_client().unwrap();
+        let report = relay_to(
+            &addr,
+            "mx.example.com",
+            "relay.example.com",
+            &message(),
+            &TlsPolicy::Strict(pkix),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(report, RelayReport::Deferred { .. }),
+            "MTA-STS enforce must defer when STARTTLS is absent, got {report:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_policy_defers_when_certificate_is_untrusted() {
+        // Under enforce, STARTTLS is offered but the cert is self-signed (does not
+        // chain to the PKIX roots), so the handshake fails and we defer — never
+        // downgrading to cleartext after offering to encrypt.
+        let (cert, key) = self_signed();
+        let config = network::TlsConfig::server_from_pem(&cert, &key).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(starttls_receiver(listener, config));
+
+        let pkix = network::TlsConfig::pkix_client().unwrap();
+        let report = relay_to(
+            &addr,
+            "mx.example.com",
+            "relay.example.com",
+            &message(),
+            &TlsPolicy::Strict(pkix),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(report, RelayReport::Deferred { .. }),
+            "a PKIX-invalid cert under enforce must defer, got {report:?}"
+        );
+    }
+
+    #[test]
+    fn exchange_tls_policy_selects_per_mode() {
+        let opportunistic = network::TlsConfig::opportunistic_client().unwrap();
+        let pkix = network::TlsConfig::pkix_client().unwrap();
+
+        // No policy → opportunistic when a config exists, else None.
+        assert!(matches!(
+            exchange_tls_policy(None, Some(&pkix), "mx.example.com", Some(&opportunistic)),
+            Some(TlsPolicy::Opportunistic(_))
+        ));
+        assert!(matches!(
+            exchange_tls_policy(None, None, "mx.example.com", None),
+            Some(TlsPolicy::None)
+        ));
+
+        // `none`/`testing` modes are advisory → opportunistic, never skipped.
+        let testing = MtaStsPolicy {
+            mode: MtaStsMode::Testing,
+            mx: vec!["other.example.com".into()],
+            max_age: 100,
+        };
+        assert!(matches!(
+            exchange_tls_policy(
+                Some(&testing),
+                Some(&pkix),
+                "mx.example.com",
+                Some(&opportunistic)
+            ),
+            Some(TlsPolicy::Opportunistic(_))
+        ));
+
+        // `enforce`: an authorized MX → Strict; an unauthorized MX → skip (None).
+        let enforce = MtaStsPolicy {
+            mode: MtaStsMode::Enforce,
+            mx: vec!["mx.example.com".into()],
+            max_age: 100,
+        };
+        assert!(matches!(
+            exchange_tls_policy(
+                Some(&enforce),
+                Some(&pkix),
+                "mx.example.com",
+                Some(&opportunistic)
+            ),
+            Some(TlsPolicy::Strict(_))
+        ));
+        assert!(
+            exchange_tls_policy(
+                Some(&enforce),
+                Some(&pkix),
+                "evil.example.net",
+                Some(&opportunistic)
+            )
+            .is_none(),
+            "an MX outside the policy must be skipped under enforce"
         );
     }
 }

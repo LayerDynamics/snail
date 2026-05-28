@@ -15,6 +15,7 @@
 //! - `SNAIL_SPF_ENFORCE`       — reject (550) inbound mail on SPF `Fail` (default off: stamp `Received-SPF` only)
 //! - `SNAIL_DMARC_ENFORCE`     — reject (550) inbound mail on a DMARC `reject` disposition (default off: stamp only)
 //! - `SNAIL_GREYLIST`          — greylist the inbound port: defer (451) first contact for an unseen triplet (default off)
+//! - `SNAIL_MTA_STS`           — enforce outbound MTA-STS (RFC 8461): PKIX-validated TLS to policy-matched MX, no cleartext fallback (default off)
 //!
 //! `SNAIL_DATA_DIR` / `SNAIL_LOG` are read via `utilities::Config`.
 
@@ -59,8 +60,20 @@ async fn main() -> anyhow::Result<()> {
     let mut server = Server::new(&config).with_tls(&certs)?;
     match HickoryResolver::from_system() {
         Ok(resolver) => {
-            server = server.with_relay(Arc::new(resolver), Arc::clone(&spool));
+            let resolver: Arc<dyn network::DnsResolver> = Arc::new(resolver);
+            server = server.with_relay(Arc::clone(&resolver), Arc::clone(&spool));
             tracing::info!(spool = %spool_dir.display(), "outbound relay enabled");
+
+            // Optional MTA-STS (RFC 8461) for outbound relay (off by default).
+            // When enabled and the recipient domain publishes an `enforce` policy,
+            // the relay uses only policy-matched MX over PKIX-validated TLS, with
+            // no cleartext fallback. The operator asked for it explicitly, so a
+            // failure to build the PKIX trust store is fatal rather than a silent
+            // downgrade to opportunistic TLS.
+            if env_flag("SNAIL_MTA_STS") {
+                server = server.with_mta_sts(resolver)?;
+                tracing::info!("outbound MTA-STS enabled");
+            }
         }
         Err(error) => {
             tracing::warn!(%error, "system DNS resolver unavailable; outbound relay disabled");

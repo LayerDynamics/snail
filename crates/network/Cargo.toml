@@ -22,6 +22,8 @@ ed25519-dalek.workspace = true
 base64.workspace = true
 # DMARC organizational-domain alignment (RFC 7489).
 psl.workspace = true
+# PKIX trust anchors for MTA-STS (RFC 8461) enforced outbound TLS + policy fetch.
+webpki-roots.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true
