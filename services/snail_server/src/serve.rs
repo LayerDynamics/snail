@@ -22,7 +22,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, Semaphore};
 use tokio_rustls::server::TlsStream;
 
-use crate::received::{MAX_RECEIVED_HOPS, received_header, received_spf_header};
+use crate::received::{
+    MAX_RECEIVED_HOPS, authentication_results_header, received_header, received_spf_header,
+};
 use crate::server::{RelayAuthorization, Server};
 use crate::worker::spawn_relay_worker;
 
@@ -505,12 +507,13 @@ pub async fn serve_inbound(
                                 "554 too many Received headers; possible mail loop\r\n"
                             }
                             Ok(mut message) => {
-                                // SPF (RFC 7208): evaluate the connecting IP against
-                                // the MAIL FROM identity when a resolver is configured.
-                                let spf = match server.resolver() {
-                                    Some(resolver) => Some(
+                                // Inbound authentication (when a resolver is configured).
+                                let resolver = server.resolver();
+                                // SPF (RFC 7208): connecting IP vs the MAIL FROM identity.
+                                let spf = match &resolver {
+                                    Some(r) => Some(
                                         network::evaluate_spf(
-                                            resolver.as_ref(),
+                                            r.as_ref(),
                                             peer.ip(),
                                             &helo,
                                             &mail_from,
@@ -525,10 +528,25 @@ pub async fn serve_inbound(
                                     tracing::warn!(peer = %peer, %mail_from, "SPF fail; rejecting (enforcement enabled)");
                                     "550 5.7.23 SPF validation failed\r\n"
                                 } else {
-                                    // Stamp Received-SPF (so DMARC can weigh it), then
-                                    // the trace hop. No-auth inbound: recipients were
-                                    // vetted local at RCPT time and relay is forbidden
-                                    // here, so this delivers locally and never relays.
+                                    // DKIM (RFC 6376 / RFC 8463): verify over the bytes
+                                    // AS RECEIVED, before we prepend any trace headers.
+                                    let dkim = match &resolver {
+                                        Some(r) => {
+                                            network::verify_dkim(r.as_ref(), &message.to_bytes())
+                                                .await
+                                        }
+                                        None => Vec::new(),
+                                    };
+                                    // Stamp Authentication-Results (SPF + DKIM, for DMARC),
+                                    // then Received-SPF, then the trace hop on top. No-auth
+                                    // inbound: recipients were vetted local at RCPT time and
+                                    // relay is forbidden here, so this delivers locally only.
+                                    message.prepend_header(&authentication_results_header(
+                                        server.host_name(),
+                                        spf,
+                                        &mail_from,
+                                        &dkim,
+                                    ));
                                     if let Some(result) = spf {
                                         message.prepend_header(&received_spf_header(
                                             result.as_str(),
@@ -1997,6 +2015,14 @@ mod tests {
         assert!(
             text.contains("Received-SPF: pass"),
             "expected a Received-SPF: pass header, got: {text:?}"
+        );
+        // The DKIM verification path also runs: with no signature on this message,
+        // the stamped Authentication-Results records spf=pass and dkim=none.
+        assert!(
+            text.contains("Authentication-Results:")
+                && text.contains("spf=pass")
+                && text.contains("dkim=none"),
+            "expected Authentication-Results with spf=pass; dkim=none, got: {text:?}"
         );
     }
 

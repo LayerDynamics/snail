@@ -5,11 +5,13 @@
 //! Policy Framework over that resolver; `tls` builds rustls configs and wraps
 //! tokio-rustls accept/connect.
 
+pub mod dkim;
 pub mod dns;
 pub mod error;
 pub mod spf;
 pub mod tls;
 
+pub use dkim::{DkimOutcome, DkimResult, verify as verify_dkim};
 pub use dns::{
     AddressRecord, DkimRecord, DmarcPolicy, DmarcRecord, DnsResolver, HickoryResolver, MxRecord,
     PtrRecord, TxtRecord,

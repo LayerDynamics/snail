@@ -11,6 +11,8 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use network::{DkimOutcome, SpfResult};
+
 /// Maximum `Received:` headers a message may already carry before it is treated
 /// as a mail loop and refused (RFC 5321 §6.3 suggests a limit of at least 100).
 pub const MAX_RECEIVED_HOPS: usize = 100;
@@ -59,6 +61,41 @@ pub fn received_spf_header(
         sanitize(helo),
     )
     .into_bytes()
+}
+
+/// Build an `Authentication-Results:` header line (no trailing CRLF, RFC 8601)
+/// recording this host's SPF and DKIM assessment, so a later stage (DMARC) and
+/// downstream readers can see the verified results. `spf` is `None` when no
+/// resolver was available; `dkim` is empty when the message carried no signature.
+#[must_use]
+pub fn authentication_results_header(
+    host: &str,
+    spf: Option<SpfResult>,
+    mail_from: &str,
+    dkim: &[DkimOutcome],
+) -> Vec<u8> {
+    let from = if mail_from.is_empty() {
+        "<>".to_string()
+    } else {
+        format!("<{}>", sanitize(mail_from))
+    };
+    let mut out = format!(
+        "Authentication-Results: {}; spf={} smtp.mailfrom={from}",
+        sanitize(host),
+        spf.map_or("none", SpfResult::as_str),
+    );
+    if dkim.is_empty() {
+        out.push_str("; dkim=none");
+    } else {
+        for outcome in dkim {
+            out.push_str(&format!(
+                "; dkim={} header.d={}",
+                outcome.result.as_str(),
+                sanitize(&outcome.domain)
+            ));
+        }
+    }
+    out.into_bytes()
 }
 
 /// Strip CR/LF (header-injection defence) from an untrusted token.
