@@ -17,6 +17,18 @@ pub enum DmarcDisposition {
     Reject,
 }
 
+impl DmarcDisposition {
+    /// The lowercase token used in an aggregate report's `<disposition>`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DmarcDisposition::None => "none",
+            DmarcDisposition::Quarantine => "quarantine",
+            DmarcDisposition::Reject => "reject",
+        }
+    }
+}
+
 /// The outcome of a DMARC evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DmarcResult {
@@ -30,6 +42,12 @@ pub struct DmarcResult {
     pub dkim_aligned: bool,
     /// The disposition to apply (after `pct` sampling).
     pub disposition: DmarcDisposition,
+    /// The domain whose DMARC record was applied — the reporting domain. Empty
+    /// when no record was found.
+    pub policy_domain: String,
+    /// The applied DMARC record (for an aggregate report's `policy_published`
+    /// section and its `rua` address); `None` when no record was found.
+    pub published: Option<DmarcRecord>,
 }
 
 impl DmarcResult {
@@ -53,6 +71,8 @@ impl DmarcResult {
             spf_aligned: false,
             dkim_aligned: false,
             disposition: DmarcDisposition::None,
+            policy_domain: String::new(),
+            published: None,
         }
     }
 }
@@ -118,12 +138,19 @@ pub async fn evaluate(
         apply_pct(policy, record.pct)
     };
 
+    let policy_domain = if at_org {
+        from_org
+    } else {
+        from_domain.to_string()
+    };
     DmarcResult {
         record_found: true,
         pass,
         spf_aligned,
         dkim_aligned,
         disposition,
+        policy_domain,
+        published: Some(record),
     }
 }
 

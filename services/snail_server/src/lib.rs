@@ -4,6 +4,7 @@
 //! the binary.
 
 pub mod config;
+pub mod dmarc_report;
 pub mod dsn;
 pub mod outbound;
 pub mod received;
@@ -13,6 +14,7 @@ pub mod spool;
 pub mod worker;
 
 pub use config::ServerConfig;
+pub use dmarc_report::{DmarcAggregator, flush_reports, spawn_report_worker};
 pub use outbound::{RelayReport, relay, relay_to};
 pub use serve::{
     ConcurrencyLimits, Listeners, run, serve_imap, serve_inbound, serve_inbound_firewalled,

@@ -28,9 +28,11 @@ tokio = { workspace = true, features = ["signal", "sync", "fs"] }
 rustls.workspace = true
 tokio-rustls.workspace = true
 rcgen.workspace = true
+base64.workspace = true
+# gzip-encode DMARC aggregate (rua) reports (RFC 7489 §7.2.1.1).
+flate2.workspace = true
 
 [dev-dependencies]
-base64.workspace = true
 async-trait.workspace = true
 governor.workspace = true
 

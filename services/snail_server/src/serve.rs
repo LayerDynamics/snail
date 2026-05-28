@@ -22,6 +22,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, Semaphore};
 use tokio_rustls::server::TlsStream;
 
+use crate::dmarc_report::{REPORT_WINDOW, spawn_report_worker};
 use crate::received::{
     MAX_RECEIVED_HOPS, authentication_results_header, received_header, received_spf_header,
 };
@@ -150,13 +151,23 @@ pub async fn run(server: Arc<Server>, listeners: &Listeners) -> std::io::Result<
         "snail-server listening"
     );
 
-    // The relay worker runs only when outbound relay is configured.
+    // The relay worker and the DMARC aggregate-report worker both run only when
+    // outbound relay is configured (reports are relayed to the rua address). Each
+    // gets its own shutdown Notify so a single `notify_one` reaches it.
     let shutdown = Arc::new(Notify::new());
     let worker = server.relay_context().is_some().then(|| {
         spawn_relay_worker(
             Arc::clone(&server),
             Arc::clone(&shutdown),
             RELAY_WORKER_TICK,
+        )
+    });
+    let report_shutdown = Arc::new(Notify::new());
+    let report_worker = server.relay_context().is_some().then(|| {
+        spawn_report_worker(
+            Arc::clone(&server),
+            Arc::clone(&report_shutdown),
+            REPORT_WINDOW,
         )
     });
 
@@ -208,8 +219,12 @@ pub async fn run(server: Arc<Server>, listeners: &Listeners) -> std::io::Result<
         let _ = handle.await;
     }
     shutdown.notify_one();
+    report_shutdown.notify_one();
     if let Some(worker) = worker {
         let _ = worker.await;
+    }
+    if let Some(report_worker) = report_worker {
+        let _ = report_worker.await;
     }
     Ok(())
 }
@@ -567,6 +582,24 @@ pub async fn serve_inbound(
                                         ),
                                         _ => None,
                                     };
+                                    // Fold this result into the aggregate report (all
+                                    // results, pass or fail, including rejected ones).
+                                    if let Some(result) = dmarc.as_ref() {
+                                        let dkim_report: Vec<(String, String)> = dkim
+                                            .iter()
+                                            .map(|o| {
+                                                (o.domain.clone(), o.result.as_str().to_string())
+                                            })
+                                            .collect();
+                                        server.dmarc_aggregator().record(
+                                            result,
+                                            peer.ip(),
+                                            &from_domain,
+                                            spf_domain,
+                                            spf_result.as_str(),
+                                            &dkim_report,
+                                        );
+                                    }
                                     let dmarc_reject = server.dmarc_enforce()
                                         && matches!(
                                             dmarc.as_ref().map(|d| d.disposition),

@@ -88,6 +88,8 @@ pub struct Server {
     /// refused (`550`); otherwise the result is only stamped in
     /// `Authentication-Results` (the default).
     dmarc_enforce: bool,
+    /// Accumulates DMARC results for periodic aggregate (`rua`) reporting.
+    dmarc_aggregator: Arc<crate::dmarc_report::DmarcAggregator>,
 }
 
 impl Server {
@@ -117,6 +119,7 @@ impl Server {
             resolver: None,
             spf_enforce: false,
             dmarc_enforce: false,
+            dmarc_aggregator: Arc::new(crate::dmarc_report::DmarcAggregator::new()),
         }
     }
 
@@ -235,6 +238,13 @@ impl Server {
     #[must_use]
     pub fn dmarc_enforce(&self) -> bool {
         self.dmarc_enforce
+    }
+
+    /// The DMARC aggregate-report accumulator (fed per inbound message, drained
+    /// by the periodic report worker).
+    #[must_use]
+    pub fn dmarc_aggregator(&self) -> &Arc<crate::dmarc_report::DmarcAggregator> {
+        &self.dmarc_aggregator
     }
 
     /// Override the relay connection port (no-op if relay is not enabled).
