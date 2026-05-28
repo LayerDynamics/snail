@@ -1,0 +1,22 @@
+[package]
+name = "client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+# `cdylib` is the wasm-bindgen output (the `.wasm`); `rlib` lets the native demo
+# binary and the test harness link against the same code.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen.workspace = true
+# The engine's mail logic, library-only (no telemetry → wasm-compatible). This is
+# what the binding exposes to JS: RFC 5322 parsing, address handling, and SMTP
+# script construction. Specified by path (not `workspace = true`) so we can set
+# `default-features = false`, which Cargo forbids when inheriting a workspace dep.
+mail = { path = "../mail", default-features = false }
+
+[lints]
+workspace = true

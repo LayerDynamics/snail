@@ -7,10 +7,26 @@ publish = false
 
 [dependencies]
 utilities.workspace = true
-telemetry.workspace = true
+# The `mail` *library* uses only the `tracing` facade; `telemetry` (which pulls a
+# non-wasm OTLP/gRPC/tokio stack) is needed solely by the demo binary. Keeping it
+# optional + default-on leaves the native workspace build unchanged while letting
+# wasm consumers (`crates/client`) opt out with `default-features = false` and get
+# a wasm-compatible library.
+telemetry = { workspace = true, optional = true }
 thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+
+[features]
+default = ["binary"]
+# Builds the `mail` demo binary, which initialises telemetry. Disable
+# (`--no-default-features`) for a library-only, wasm-compatible build.
+binary = ["dep:telemetry"]
+
+[[bin]]
+name = "mail"
+path = "src/main.rs"
+required-features = ["binary"]
 
 [lints]
 workspace = true

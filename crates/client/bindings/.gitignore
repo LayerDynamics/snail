@@ -1,0 +1,6 @@
+# `wasm-pack build --out-dir bindings` generates the WASM package here.
+# The artifacts are build output and are not committed; only this file and the
+# README (which documents how to regenerate them) are tracked.
+*
+!.gitignore
+!README.md

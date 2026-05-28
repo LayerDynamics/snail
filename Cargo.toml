@@ -9,6 +9,7 @@ members = [
     "crates/identity",
     "crates/access",
     "crates/filter",
+    "crates/client",
     "services/snail_server",
 ]
 
@@ -75,6 +76,9 @@ rustls-webpki = { version = "0.103", default-features = false, features = ["allo
 
 # Identity / auth (m11)
 base64 = "0.22"
+
+# Native client binding (crates/client): Rust↔JS FFI via WebAssembly.
+wasm-bindgen = "0.2"
 
 # Internal crates
 utilities = { path = "crates/utilities" }
