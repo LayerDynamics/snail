@@ -7,6 +7,7 @@
 //! policies for the outbound relay; `tls` builds rustls configs and wraps
 //! tokio-rustls accept/connect.
 
+pub mod dane;
 pub mod dkim;
 pub mod dmarc;
 pub mod dns;
@@ -15,11 +16,13 @@ pub mod mta_sts;
 pub mod spf;
 pub mod tls;
 
+pub use dane::{DaneVerifier, has_usable_tlsa};
 pub use dkim::{DkimOutcome, DkimResult, verify as verify_dkim};
 pub use dmarc::{DmarcDisposition, DmarcResult, evaluate as evaluate_dmarc};
 pub use dns::{
     AddressRecord, AlignmentMode, DkimRecord, DmarcPolicy, DmarcRecord, DnsResolver,
-    HickoryResolver, MxRecord, PtrRecord, TxtRecord,
+    HickoryResolver, MxRecord, PtrRecord, TlsaMatching, TlsaRecord, TlsaSelector, TlsaUsage,
+    TxtRecord,
 };
 pub use error::{NetworkError, Result};
 pub use mta_sts::{MtaStsMode, MtaStsPolicy, MtaStsResolver};

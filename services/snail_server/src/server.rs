@@ -97,6 +97,11 @@ pub struct Server {
     /// default): in `enforce` mode it restricts which MX are used and mandates a
     /// PKIX-validated TLS connection with no cleartext fallback.
     mta_sts: Option<Arc<MtaStsResolver>>,
+    /// Whether outbound DANE (RFC 7672) is enabled (off by default). When on and
+    /// a recipient's MX RRset is DNSSEC-secure, exchanges publishing a usable
+    /// TLSA RRset get DANE-authenticated TLS (no cleartext fallback); DANE takes
+    /// precedence over MTA-STS.
+    dane: bool,
 }
 
 impl Server {
@@ -129,6 +134,7 @@ impl Server {
             dmarc_aggregator: Arc::new(crate::dmarc_report::DmarcAggregator::new()),
             greylist: None,
             mta_sts: None,
+            dane: false,
         }
     }
 
@@ -286,6 +292,22 @@ impl Server {
     #[must_use]
     pub fn mta_sts(&self) -> Option<&MtaStsResolver> {
         self.mta_sts.as_deref()
+    }
+
+    /// Enable outbound DANE (RFC 7672) for the relay (off by default). Requires a
+    /// DNSSEC-validating resolver (the live [`network::HickoryResolver`] provides
+    /// one); with a non-validating resolver no TLSA RRset is ever `Proof::Secure`,
+    /// so DANE simply never engages.
+    #[must_use]
+    pub fn with_dane(mut self, enabled: bool) -> Self {
+        self.dane = enabled;
+        self
+    }
+
+    /// Whether outbound DANE is enabled.
+    #[must_use]
+    pub fn dane(&self) -> bool {
+        self.dane
     }
 
     /// Override the relay connection port (no-op if relay is not enabled).

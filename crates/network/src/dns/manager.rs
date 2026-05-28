@@ -2,33 +2,114 @@
 //! the system resolver configuration, plus the pure hickory→typed mapping.
 
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use hickory_resolver::Name;
-use hickory_resolver::TokioAsyncResolver;
-use hickory_resolver::proto::rr::rdata::{MX, TXT};
+use hickory_resolver::TokioResolver;
+use hickory_resolver::proto::dnssec::TrustAnchors;
+use hickory_resolver::proto::rr::rdata::{MX, TLSA, TXT};
+use hickory_resolver::proto::rr::{Name, RData, Record, RecordType};
 
 use crate::dns::lookup::DnsResolver;
-use crate::dns::{AddressRecord, MxRecord, PtrRecord, TxtRecord};
+use crate::dns::{
+    AddressRecord, MxRecord, PtrRecord, TlsaMatching, TlsaRecord, TlsaSelector, TlsaUsage,
+    TxtRecord,
+};
 use crate::error::{NetworkError, Result};
 
 /// A live DNS resolver backed by hickory + the host's resolver configuration.
+///
+/// Holds two resolvers built from the same system configuration:
+/// - `inner` does **not** validate DNSSEC and serves the hot lookup paths
+///   (MX/A+AAAA/TXT/PTR), preserving prior behaviour against unsigned zones and
+///   non-validating upstreams.
+/// - `validating` performs DNSSEC validation (rooted at the IANA trust anchors)
+///   and backs DANE (`secure_tlsa` / `secure_mx`), where an answer is only
+///   trusted when it is `Proof::Secure`.
 pub struct HickoryResolver {
-    inner: TokioAsyncResolver,
+    inner: TokioResolver,
+    validating: TokioResolver,
 }
 
 impl HickoryResolver {
     /// Build a resolver from the system configuration (`/etc/resolv.conf`, etc.).
     ///
+    /// This resolver does **not** perform DNSSEC validation — it preserves the
+    /// behaviour of the previous releases for the hot lookup paths
+    /// (MX/A/AAAA/TXT/PTR), which must keep working against unsigned zones and
+    /// non-validating upstream resolvers. DANE's DNSSEC requirement is served by
+    /// a separate validating resolver (see the `dane` module / `secure_tlsa`),
+    /// so a stub resolver that strips RRSIG cannot break ordinary mail routing.
+    ///
     /// # Errors
     /// [`NetworkError::Resolve`] if the system configuration cannot be read.
     pub fn from_system() -> Result<Self> {
-        let inner =
-            TokioAsyncResolver::tokio_from_system_conf().map_err(|e| NetworkError::Resolve {
-                name: "<system-conf>".into(),
+        let system_err = |e: String| NetworkError::Resolve {
+            name: "<system-conf>".into(),
+            reason: e,
+        };
+        let inner = TokioResolver::builder_tokio()
+            .and_then(|builder| builder.build())
+            .map_err(|e| system_err(e.to_string()))?;
+        // The validating resolver enables DNSSEC by supplying the IANA root trust
+        // anchors (which sets `validate = true`); only `Proof::Secure` answers are
+        // honoured for DANE.
+        let validating = TokioResolver::builder_tokio()
+            .and_then(|builder| {
+                builder
+                    .with_trust_anchor(Arc::new(TrustAnchors::default()))
+                    .build()
+            })
+            .map_err(|e| system_err(e.to_string()))?;
+        Ok(Self { inner, validating })
+    }
+
+    /// Run a generic lookup, returning the answer records. A `NoRecordsFound`
+    /// response maps to an **empty** vector (not an error) so callers can treat
+    /// "the name exists but has no records of this type" distinctly from a real
+    /// failure — the MX→A/AAAA fallback in the relay depends on this.
+    async fn answers(&self, name: &str, record_type: RecordType) -> Result<Vec<Record>> {
+        match self.inner.lookup(name, record_type).await {
+            Ok(lookup) => Ok(lookup.answers().to_vec()),
+            Err(e) if e.is_no_records_found() => Ok(Vec::new()),
+            Err(e) => Err(NetworkError::Resolve {
+                name: name.into(),
                 reason: e.to_string(),
-            })?;
-        Ok(Self { inner })
+            }),
+        }
+    }
+
+    /// Run a lookup through the **validating** resolver and return the answer
+    /// records of `record_type` **only if every one is DNSSEC-validated**
+    /// (`Proof::Secure`). Any other outcome — an unsigned (`Insecure`) zone, a
+    /// failed validation (`Bogus`), no records, or a resolver error — yields
+    /// `None`, i.e. "nothing securely available". This is the gate that keeps
+    /// DANE from ever trusting unauthenticated DNS data.
+    async fn secure_answers(&self, name: &str, record_type: RecordType) -> Option<Vec<Record>> {
+        let lookup = self.validating.lookup(name, record_type).await.ok()?;
+        let answers: Vec<Record> = lookup
+            .answers()
+            .iter()
+            .filter(|r| r.record_type() == record_type)
+            .cloned()
+            .collect();
+        if answers.is_empty() {
+            return None;
+        }
+        answers
+            .iter()
+            .all(|r| r.proof.is_secure())
+            .then_some(answers)
+    }
+}
+
+/// Map a hickory TLSA record to the backend-independent [`TlsaRecord`].
+fn map_tlsa(tlsa: &TLSA) -> TlsaRecord {
+    TlsaRecord {
+        usage: TlsaUsage::from_u8(u8::from(tlsa.cert_usage)),
+        selector: TlsaSelector::from_u8(u8::from(tlsa.selector)),
+        matching: TlsaMatching::from_u8(u8::from(tlsa.matching)),
+        data: tlsa.cert_data.clone(),
     }
 }
 
@@ -40,8 +121,8 @@ fn strip_root(name: &Name) -> String {
 /// Map a hickory MX record to [`MxRecord`].
 fn map_mx(mx: &MX) -> MxRecord {
     MxRecord {
-        preference: mx.preference(),
-        exchange: strip_root(mx.exchange()),
+        preference: mx.preference,
+        exchange: strip_root(&mx.exchange),
     }
 }
 
@@ -49,7 +130,7 @@ fn map_mx(mx: &MX) -> MxRecord {
 /// (DKIM/DMARC values are frequently split across several).
 fn map_txt(txt: &TXT) -> TxtRecord {
     let joined = txt
-        .txt_data()
+        .txt_data
         .iter()
         .map(|b| String::from_utf8_lossy(b))
         .collect::<String>();
@@ -59,55 +140,82 @@ fn map_txt(txt: &TXT) -> TxtRecord {
 #[async_trait]
 impl DnsResolver for HickoryResolver {
     async fn lookup_mx(&self, domain: &str) -> Result<Vec<MxRecord>> {
-        let lookup = self
-            .inner
-            .mx_lookup(domain)
-            .await
-            .map_err(|e| NetworkError::Resolve {
-                name: domain.into(),
-                reason: e.to_string(),
-            })?;
-        Ok(lookup.iter().map(map_mx).collect())
+        let answers = self.answers(domain, RecordType::MX).await?;
+        Ok(answers
+            .iter()
+            .filter_map(|r| match &r.data {
+                RData::MX(mx) => Some(map_mx(mx)),
+                _ => None,
+            })
+            .collect())
     }
 
     async fn lookup_ip(&self, host: &str) -> Result<Vec<AddressRecord>> {
-        let lookup = self
-            .inner
-            .lookup_ip(host)
-            .await
-            .map_err(|e| NetworkError::Resolve {
+        match self.inner.lookup_ip(host).await {
+            Ok(lookup) => Ok(lookup.iter().map(AddressRecord).collect()),
+            Err(e) if e.is_no_records_found() => Ok(Vec::new()),
+            Err(e) => Err(NetworkError::Resolve {
                 name: host.into(),
                 reason: e.to_string(),
-            })?;
-        Ok(lookup.iter().map(AddressRecord).collect())
+            }),
+        }
     }
 
     async fn lookup_txt(&self, name: &str) -> Result<Vec<TxtRecord>> {
-        let lookup = self
-            .inner
-            .txt_lookup(name)
-            .await
-            .map_err(|e| NetworkError::Resolve {
-                name: name.into(),
-                reason: e.to_string(),
-            })?;
-        Ok(lookup.iter().map(map_txt).collect())
+        let answers = self.answers(name, RecordType::TXT).await?;
+        Ok(answers
+            .iter()
+            .filter_map(|r| match &r.data {
+                RData::TXT(txt) => Some(map_txt(txt)),
+                _ => None,
+            })
+            .collect())
     }
 
     async fn reverse_lookup(&self, ip: IpAddr) -> Result<Vec<PtrRecord>> {
-        let lookup = self
-            .inner
-            .reverse_lookup(ip)
-            .await
-            .map_err(|e| NetworkError::Resolve {
-                name: ip.to_string(),
-                reason: e.to_string(),
-            })?;
-        // `PTR` implements `Display` as its inner `Name`.
-        Ok(lookup
+        // `Name::from(IpAddr)` yields the reverse-DNS pointer name
+        // (`d.c.b.a.in-addr.arpa` / nibble-reversed `…ip6.arpa`).
+        let name = Name::from(ip).to_string();
+        let answers = self.answers(&name, RecordType::PTR).await?;
+        Ok(answers
             .iter()
-            .map(|ptr| PtrRecord(ptr.to_string().trim_end_matches('.').to_string()))
+            .filter_map(|r| match &r.data {
+                // `PTR` implements `Display` as its inner `Name`.
+                RData::PTR(ptr) => {
+                    Some(PtrRecord(ptr.to_string().trim_end_matches('.').to_string()))
+                }
+                _ => None,
+            })
             .collect())
+    }
+
+    async fn secure_tlsa(&self, port: u16, host: &str) -> Result<Option<Vec<TlsaRecord>>> {
+        let name = format!("_{port}._tcp.{}", host.trim_end_matches('.'));
+        let Some(answers) = self.secure_answers(&name, RecordType::TLSA).await else {
+            return Ok(None);
+        };
+        let records: Vec<TlsaRecord> = answers
+            .iter()
+            .filter_map(|r| match &r.data {
+                RData::TLSA(tlsa) => Some(map_tlsa(tlsa)),
+                _ => None,
+            })
+            .collect();
+        Ok((!records.is_empty()).then_some(records))
+    }
+
+    async fn secure_mx(&self, domain: &str) -> Result<Option<Vec<MxRecord>>> {
+        let Some(answers) = self.secure_answers(domain, RecordType::MX).await else {
+            return Ok(None);
+        };
+        let records: Vec<MxRecord> = answers
+            .iter()
+            .filter_map(|r| match &r.data {
+                RData::MX(mx) => Some(map_mx(mx)),
+                _ => None,
+            })
+            .collect();
+        Ok((!records.is_empty()).then_some(records))
     }
 }
 

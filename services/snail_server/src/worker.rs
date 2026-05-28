@@ -53,6 +53,7 @@ pub async fn relay_due(server: &Server) {
             &message,
             ctx.tls.as_ref(),
             server.mta_sts(),
+            server.dane(),
         )
         .await
         {

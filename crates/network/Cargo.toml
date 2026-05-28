@@ -24,6 +24,11 @@ base64.workspace = true
 psl.workspace = true
 # PKIX trust anchors for MTA-STS (RFC 8461) enforced outbound TLS + policy fetch.
 webpki-roots.workspace = true
+# X.509 parsing for DANE (RFC 7672): SubjectPublicKeyInfo extraction (TLSA
+# selector `Spki`) and chain-certificate decoding for DANE-TA.
+x509-cert.workspace = true
+# WebPKI chain verification for DANE-TA (usage 2).
+rustls-webpki.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true

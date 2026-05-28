@@ -365,6 +365,14 @@ pub async fn relay_to(
 /// and each is delivered to under [`TlsPolicy::Strict`] (PKIX-validated TLS, no
 /// cleartext fallback). With no policy (or `none`/`testing` mode) the relay falls
 /// back to the opportunistic `tls` behaviour.
+///
+/// `dane`, when `true`, enables RFC 7672 DANE, which takes **precedence** over
+/// MTA-STS. When the recipient's MX RRset is DNSSEC-validated (the §2.2
+/// precondition), that secure MX list is used (so the hostnames cannot be
+/// spoofed) and any exchange publishing a usable, DNSSEC-validated TLSA RRset is
+/// delivered to under DANE-authenticated TLS with no cleartext fallback. A
+/// secure-MX host without usable TLSA falls back to opportunistic TLS.
+#[allow(clippy::too_many_arguments)]
 pub async fn relay(
     resolver: &dyn DnsResolver,
     helo: &str,
@@ -372,6 +380,7 @@ pub async fn relay(
     message: &Message,
     tls: Option<&Arc<ClientConfig>>,
     mta_sts: Option<&MtaStsResolver>,
+    dane: bool,
 ) -> RelayReport {
     let Some(domain) = message
         .envelope
@@ -384,22 +393,39 @@ pub async fn relay(
         };
     };
 
-    let exchanges = match resolver.lookup_mx(&domain).await {
-        Ok(mut mxs) if !mxs.is_empty() => {
+    // DANE precondition (RFC 7672 §2.2): only trust TLSA records when the MX
+    // RRset itself is DNSSEC-secure. When it is, the *secure* MX list is
+    // authoritative (an attacker cannot inject MX hostnames); otherwise DANE does
+    // not apply and we fall back to the ordinary lookup with its no-MX→A fallback.
+    let secure_mx = if dane {
+        resolver.secure_mx(&domain).await.unwrap_or(None)
+    } else {
+        None
+    };
+    let dane_active = secure_mx.is_some();
+
+    let exchanges = match secure_mx {
+        Some(mut mxs) => {
             mxs.sort_by_key(|mx| mx.preference);
             mxs
         }
-        // No MX record: the domain's own A/AAAA is the implicit mail exchange.
-        Ok(_) => vec![MxRecord {
-            preference: 0,
-            exchange: domain.clone(),
-        }],
-        Err(error) => {
-            return RelayReport::Deferred {
-                code: 0,
-                text: format!("MX lookup for {domain}: {error}"),
-            };
-        }
+        None => match resolver.lookup_mx(&domain).await {
+            Ok(mut mxs) if !mxs.is_empty() => {
+                mxs.sort_by_key(|mx| mx.preference);
+                mxs
+            }
+            // No MX record: the domain's own A/AAAA is the implicit mail exchange.
+            Ok(_) => vec![MxRecord {
+                preference: 0,
+                exchange: domain.clone(),
+            }],
+            Err(error) => {
+                return RelayReport::Deferred {
+                    code: 0,
+                    text: format!("MX lookup for {domain}: {error}"),
+                };
+            }
+        },
     };
 
     // RFC 7505 null MX: a `0 .` record means the domain explicitly accepts no
@@ -412,11 +438,16 @@ pub async fn relay(
         };
     }
 
-    // Resolve any MTA-STS policy for the recipient domain. In `enforce` mode it
-    // both constrains which exchanges are usable and mandates PKIX TLS to them.
-    let sts_policy = match mta_sts {
-        Some(sts) => sts.policy_for(&domain).await,
-        None => None,
+    // MTA-STS is consulted only when DANE is not active for the domain (DANE has
+    // precedence, RFC 7672). In `enforce` mode it both constrains which exchanges
+    // are usable and mandates PKIX TLS to them.
+    let sts_policy = if dane_active {
+        None
+    } else {
+        match mta_sts {
+            Some(sts) => sts.policy_for(&domain).await,
+            None => None,
+        }
     };
     let enforce = sts_policy
         .as_ref()
@@ -435,11 +466,24 @@ pub async fn relay(
         if mx.is_null() {
             continue;
         }
-        // Per-exchange TLS posture. Under MTA-STS enforce an unauthorized MX is
-        // skipped entirely (RFC 8461 §4.1); an authorized one is delivered to
-        // under Strict (PKIX, mandatory); otherwise opportunistic (or none).
-        let Some(tls_policy) = exchange_tls_policy(sts_policy.as_ref(), pkix, &mx.exchange, tls)
-        else {
+        // Per-exchange TLS posture, in precedence order:
+        //  1. DANE (RFC 7672): a secure-MX host with a usable, DNSSEC-validated
+        //     TLSA RRset is delivered to under DANE-authenticated TLS (Strict, no
+        //     cleartext fallback); a secure-MX host without TLSA → opportunistic.
+        //  2. MTA-STS enforce (RFC 8461): an unauthorized MX is skipped, an
+        //     authorized one is delivered to under PKIX-validated Strict TLS.
+        //  3. otherwise opportunistic (or none).
+        let tls_policy = if dane_active {
+            match dane_tls_policy(resolver, port, &mx.exchange).await {
+                Some(config) => Some(TlsPolicy::Strict(config)),
+                None => {
+                    Some(tls.map_or(TlsPolicy::None, |c| TlsPolicy::Opportunistic(Arc::clone(c))))
+                }
+            }
+        } else {
+            exchange_tls_policy(sts_policy.as_ref(), pkix, &mx.exchange, tls)
+        };
+        let Some(tls_policy) = tls_policy else {
             continue;
         };
         attempted = true;
@@ -506,6 +550,25 @@ fn exchange_tls_policy(
         return pkix.map(|c| TlsPolicy::Strict(Arc::clone(c)));
     }
     Some(opportunistic.map_or(TlsPolicy::None, |c| TlsPolicy::Opportunistic(Arc::clone(c))))
+}
+
+/// Build a DANE-authenticated client TLS config for one mail exchange (RFC 7672),
+/// or `None` if the host publishes no *usable*, DNSSEC-validated TLSA RRset (in
+/// which case the caller falls back to opportunistic TLS for that host). The TLSA
+/// lookup is `_<port>._tcp.<host>` and only `Proof::Secure` answers are returned
+/// (enforced by `secure_tlsa`); records with unusable usages/fields are filtered
+/// by [`network::has_usable_tlsa`] so an all-unusable RRset is treated as "no
+/// TLSA" rather than an undeliverable host (RFC 6698 §2.2.4).
+async fn dane_tls_policy(
+    resolver: &dyn DnsResolver,
+    port: u16,
+    host: &str,
+) -> Option<Arc<ClientConfig>> {
+    let records = resolver.secure_tlsa(port, host).await.ok().flatten()?;
+    if !network::has_usable_tlsa(&records) {
+        return None;
+    }
+    network::TlsConfig::dane_client(records).ok()
 }
 
 /// Resolve an MX exchange to its IP address(es) via `resolver`. An address-literal
@@ -909,6 +972,7 @@ mod tests {
             &message(),
             None,
             None,
+            false,
         )
         .await;
         assert!(
@@ -963,6 +1027,7 @@ mod tests {
             &message(),
             None,
             None,
+            false,
         )
         .await;
         assert_eq!(report, RelayReport::Delivered);
@@ -996,7 +1061,16 @@ mod tests {
                 Ok(Vec::new())
             }
         }
-        let report = relay(&NoAddr, "relay.example.com", 25, &message(), None, None).await;
+        let report = relay(
+            &NoAddr,
+            "relay.example.com",
+            25,
+            &message(),
+            None,
+            None,
+            false,
+        )
+        .await;
         assert!(
             matches!(report, RelayReport::Deferred { .. }),
             "an MX with no address is transient, got {report:?}"
@@ -1018,7 +1092,7 @@ mod tests {
             b"Subject: probe\r\n\r\nignored",
         )
         .unwrap();
-        let report = relay(&resolver, "snail.invalid", 25, &probe, None, None).await;
+        let report = relay(&resolver, "snail.invalid", 25, &probe, None, None, false).await;
         assert!(
             !matches!(report, RelayReport::Delivered),
             "example.com must not accept mail, got {report:?}"
@@ -1132,6 +1206,123 @@ mod tests {
             )
             .is_none(),
             "an MX outside the policy must be skipped under enforce"
+        );
+    }
+
+    /// A resolver that publishes a DNSSEC-secure MX (`mx.test` → loopback) and a
+    /// caller-supplied DNSSEC-validated TLSA RRset for it, driving the DANE relay
+    /// path. (`secure_mx`/`secure_tlsa` standing in for a validating resolver.)
+    struct DaneResolver {
+        tlsa: Vec<network::TlsaRecord>,
+    }
+
+    #[async_trait::async_trait]
+    impl network::DnsResolver for DaneResolver {
+        async fn lookup_mx(&self, _domain: &str) -> network::Result<Vec<MxRecord>> {
+            Ok(Vec::new())
+        }
+        async fn lookup_ip(&self, host: &str) -> network::Result<Vec<network::AddressRecord>> {
+            if host == "mx.test" {
+                Ok(vec![network::AddressRecord("127.0.0.1".parse().unwrap())])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+        async fn lookup_txt(&self, _name: &str) -> network::Result<Vec<network::TxtRecord>> {
+            Ok(Vec::new())
+        }
+        async fn reverse_lookup(
+            &self,
+            _ip: std::net::IpAddr,
+        ) -> network::Result<Vec<network::PtrRecord>> {
+            Ok(Vec::new())
+        }
+        async fn secure_mx(&self, _domain: &str) -> network::Result<Option<Vec<MxRecord>>> {
+            Ok(Some(vec![MxRecord {
+                preference: 10,
+                exchange: "mx.test".to_string(),
+            }]))
+        }
+        async fn secure_tlsa(
+            &self,
+            _port: u16,
+            host: &str,
+        ) -> network::Result<Option<Vec<network::TlsaRecord>>> {
+            Ok((host == "mx.test").then(|| self.tlsa.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_delivers_over_dane_when_tlsa_matches() {
+        // A cert for `mx.test`, with a TLSA `3 0 0` (DANE-EE, full cert) naming it.
+        let ck = rcgen::generate_simple_self_signed(vec!["mx.test".to_string()]).unwrap();
+        let cert_der = ck.cert.der().as_ref().to_vec();
+        let server_config =
+            network::TlsConfig::server_from_pem(&ck.cert.pem(), &ck.key_pair.serialize_pem())
+                .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(starttls_receiver(listener, server_config));
+
+        let resolver = DaneResolver {
+            tlsa: vec![network::TlsaRecord {
+                usage: network::TlsaUsage::DaneEe,
+                selector: network::TlsaSelector::Full,
+                matching: network::TlsaMatching::Full,
+                data: cert_der,
+            }],
+        };
+        let opp = network::TlsConfig::opportunistic_client().unwrap();
+        let report = relay(
+            &resolver,
+            "relay.example.com",
+            port,
+            &message(),
+            Some(&opp),
+            None,
+            true,
+        )
+        .await;
+        assert_eq!(report, RelayReport::Delivered);
+
+        // The body was read only after the (DANE-authenticated) TLS handshake.
+        let body = server.await.unwrap();
+        assert!(body.contains("hello world"));
+    }
+
+    #[tokio::test]
+    async fn relay_defers_over_dane_when_tlsa_mismatches() {
+        // The server's cert does NOT match the published TLSA association, so the
+        // DANE handshake fails and the relay MUST defer — never fall back to
+        // cleartext (RFC 7672: DANE is mandatory once a usable TLSA RRset exists).
+        let (cert, key) = self_signed();
+        let server_config = network::TlsConfig::server_from_pem(&cert, &key).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(starttls_receiver(listener, server_config));
+
+        let resolver = DaneResolver {
+            tlsa: vec![network::TlsaRecord {
+                usage: network::TlsaUsage::DaneEe,
+                selector: network::TlsaSelector::Spki,
+                matching: network::TlsaMatching::Sha256,
+                data: vec![0xAB; 32], // does not match the presented cert
+            }],
+        };
+        let opp = network::TlsConfig::opportunistic_client().unwrap();
+        let report = relay(
+            &resolver,
+            "relay.example.com",
+            port,
+            &message(),
+            Some(&opp),
+            None,
+            true,
+        )
+        .await;
+        assert!(
+            matches!(report, RelayReport::Deferred { .. }),
+            "a DANE mismatch must defer (no cleartext), got {report:?}"
         );
     }
 }

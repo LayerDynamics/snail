@@ -114,6 +114,33 @@ impl TlsConfig {
             .with_no_client_auth();
         Ok(Arc::new(config))
     }
+
+    /// Build a client [`ClientConfig`] that authenticates the peer via **DANE**
+    /// (RFC 7672) against the given DNSSEC-validated TLSA records, using
+    /// [`crate::dane::DaneVerifier`]. The handshake succeeds only when the peer's
+    /// certificate (chain) matches a usable TLSA association — there is no PKIX
+    /// fallback. The relay uses this for an MX that publishes a secure TLSA RRset.
+    ///
+    /// The active process-wide crypto provider backs both the config and the
+    /// verifier (falling back to `aws-lc-rs` when none is installed, so tests work
+    /// without an explicit install).
+    ///
+    /// # Errors
+    /// [`NetworkError::Tls`] if the provider cannot build a config for the default
+    /// protocol versions.
+    pub fn dane_client(tlsa: Vec<crate::dns::TlsaRecord>) -> Result<Arc<ClientConfig>> {
+        let provider = CryptoProvider::get_default()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
+        let verifier = Arc::new(crate::dane::DaneVerifier::new(tlsa, Arc::clone(&provider)));
+        let config = ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| NetworkError::Tls(format!("building DANE client config: {e}")))?
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+        Ok(Arc::new(config))
+    }
 }
 
 /// A [`ServerCertVerifier`] for **opportunistic** SMTP TLS: it accepts any server

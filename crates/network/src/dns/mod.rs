@@ -8,6 +8,7 @@ pub mod lookup;
 pub mod manager;
 pub mod mx;
 pub mod reverse;
+pub mod tlsa;
 pub mod txt;
 
 pub use a::AddressRecord;
@@ -17,4 +18,5 @@ pub use lookup::DnsResolver;
 pub use manager::HickoryResolver;
 pub use mx::MxRecord;
 pub use reverse::PtrRecord;
+pub use tlsa::{TlsaMatching, TlsaRecord, TlsaSelector, TlsaUsage};
 pub use txt::TxtRecord;

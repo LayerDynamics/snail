@@ -37,7 +37,9 @@ tracing-opentelemetry = "0.28"
 # Async runtime + networking (m9)
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time"] }
 async-trait = "0.1"
-hickory-resolver = "0.24"
+# DNSSEC validation (dnssec-aws-lc-rs, matching the rustls aws-lc-rs provider) is
+# required for DANE (RFC 7672): TLSA records are only trusted when Proof::Secure.
+hickory-resolver = { version = "0.26", features = ["dnssec-aws-lc-rs"] }
 rustls = "0.23"
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
@@ -63,6 +65,13 @@ flate2 = "1"
 # PKIX trust anchors for MTA-STS (RFC 8461): HTTPS policy fetch + enforced
 # outbound TLS certificate verification.
 webpki-roots = "0.26"
+# X.509 parsing for DANE (RFC 7672): extract the SubjectPublicKeyInfo for TLSA
+# selector `Spki`, and decode chain certificates for DANE-TA matching.
+x509-cert = "0.2"
+# WebPKI chain verification for DANE-TA (usage 2): validate the server chain up
+# to the TLSA-matched trust anchor. Crypto algorithms are supplied by the active
+# rustls CryptoProvider, so no built-in crypto backend is enabled here.
+rustls-webpki = { version = "0.103", default-features = false, features = ["alloc", "std"] }
 
 # Identity / auth (m11)
 base64 = "0.22"

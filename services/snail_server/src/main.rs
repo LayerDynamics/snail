@@ -16,6 +16,7 @@
 //! - `SNAIL_DMARC_ENFORCE`     — reject (550) inbound mail on a DMARC `reject` disposition (default off: stamp only)
 //! - `SNAIL_GREYLIST`          — greylist the inbound port: defer (451) first contact for an unseen triplet (default off)
 //! - `SNAIL_MTA_STS`           — enforce outbound MTA-STS (RFC 8461): PKIX-validated TLS to policy-matched MX, no cleartext fallback (default off)
+//! - `SNAIL_DANE`              — enable outbound DANE (RFC 7672): DNSSEC-validated TLSA authentication of the MX, no cleartext fallback; takes precedence over MTA-STS (default off)
 //!
 //! `SNAIL_DATA_DIR` / `SNAIL_LOG` are read via `utilities::Config`.
 
@@ -71,8 +72,18 @@ async fn main() -> anyhow::Result<()> {
             // failure to build the PKIX trust store is fatal rather than a silent
             // downgrade to opportunistic TLS.
             if env_flag("SNAIL_MTA_STS") {
-                server = server.with_mta_sts(resolver)?;
+                server = server.with_mta_sts(Arc::clone(&resolver))?;
                 tracing::info!("outbound MTA-STS enabled");
+            }
+
+            // Optional DANE (RFC 7672) for outbound relay (off by default). DANE
+            // takes precedence over MTA-STS: an MX with a DNSSEC-validated TLSA
+            // RRset is delivered to under DANE-authenticated TLS, no cleartext
+            // fallback. The live resolver validates DNSSEC, so TLSA is only
+            // trusted when `Proof::Secure`.
+            if env_flag("SNAIL_DANE") {
+                server = server.with_dane(true);
+                tracing::info!("outbound DANE enabled");
             }
         }
         Err(error) => {

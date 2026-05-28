@@ -4,7 +4,9 @@ use std::net::IpAddr;
 
 use async_trait::async_trait;
 
-use crate::dns::{AddressRecord, DkimRecord, DmarcRecord, MxRecord, PtrRecord, TxtRecord};
+use crate::dns::{
+    AddressRecord, DkimRecord, DmarcRecord, MxRecord, PtrRecord, TlsaRecord, TxtRecord,
+};
 use crate::error::{NetworkError, Result};
 
 /// Async DNS resolution contract used across Snail. Implementers provide the four
@@ -50,6 +52,30 @@ pub trait DnsResolver: Send + Sync {
                 kind: "DMARC".into(),
                 reason: format!("no parseable DMARC record at {name}"),
             })
+    }
+
+    /// Fetch the **DNSSEC-validated** TLSA records for a mail exchange at
+    /// `_<port>._tcp.<host>` (DANE, RFC 7672). Returns `Some(records)` **only**
+    /// when the answer was DNSSEC-validated (`Proof::Secure`); `None` means there
+    /// is no securely-published TLSA RRset and DANE MUST NOT be used (RFC 7672
+    /// §2.1.1). The `Option` makes insecure data unrepresentable to callers, so a
+    /// non-validating resolver cannot accidentally authenticate a peer.
+    ///
+    /// The default implementation returns `None`: a resolver that performs no
+    /// DNSSEC validation cannot authenticate DANE associations.
+    async fn secure_tlsa(&self, _port: u16, _host: &str) -> Result<Option<Vec<TlsaRecord>>> {
+        Ok(None)
+    }
+
+    /// Fetch the **DNSSEC-validated** MX records for a domain (the DANE
+    /// precondition, RFC 7672 §2.2: TLSA records of an MX host may only be
+    /// trusted when the MX RRset itself was obtained securely, else an attacker
+    /// who spoofs an insecure MX could redirect to a host bearing its own valid
+    /// TLSA). Returns `Some(records)` only when the MX RRset was `Proof::Secure`.
+    ///
+    /// The default implementation returns `None` (no secure MX → no DANE).
+    async fn secure_mx(&self, _domain: &str) -> Result<Option<Vec<MxRecord>>> {
+        Ok(None)
     }
 }
 
