@@ -31,6 +31,36 @@ pub fn received_header(helo: &str, host: &str, proto: &str, at: SystemTime) -> V
     .into_bytes()
 }
 
+/// Build a `Received-SPF:` header line (no trailing CRLF) recording an SPF
+/// result (RFC 7208 §9.1). `result` is the lowercase token (`pass`, `fail`, …).
+/// All interpolated fields are CR/LF-sanitised against header injection.
+#[must_use]
+pub fn received_spf_header(
+    result: &str,
+    host: &str,
+    client_ip: &str,
+    envelope_from: &str,
+    helo: &str,
+) -> Vec<u8> {
+    let from = if envelope_from.is_empty() {
+        "<>".to_string()
+    } else {
+        format!("<{}>", sanitize(envelope_from))
+    };
+    format!(
+        "Received-SPF: {} ({}: client-ip {} is {} for {}) client-ip={}; envelope-from={}; helo={};",
+        sanitize(result),
+        sanitize(host),
+        sanitize(client_ip),
+        sanitize(result),
+        from,
+        sanitize(client_ip),
+        from,
+        sanitize(helo),
+    )
+    .into_bytes()
+}
+
 /// Strip CR/LF (header-injection defence) from an untrusted token.
 fn sanitize(s: &str) -> String {
     s.replace(['\r', '\n'], "")

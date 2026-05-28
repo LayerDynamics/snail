@@ -77,6 +77,13 @@ pub struct Server {
     firewall: Arc<Firewall>,
     auth_throttle: Arc<AuthThrottle>,
     collector_max_size: usize,
+    /// Resolver for inbound message authentication (SPF). Independent of outbound
+    /// relay, so inbound SPF works even when relay is disabled; populated by
+    /// [`Server::with_relay`] or [`Server::with_resolver`].
+    resolver: Option<Arc<dyn DnsResolver>>,
+    /// When `true`, an SPF `Fail` rejects the message (`550`); otherwise the result
+    /// is only stamped in a `Received-SPF` header for DMARC to weigh (the default).
+    spf_enforce: bool,
 }
 
 impl Server {
@@ -103,6 +110,8 @@ impl Server {
             firewall: Arc::new(Firewall::new(&FirewallConfig::default())),
             auth_throttle: Arc::new(AuthThrottle::new(ThrottleConfig::default())),
             collector_max_size: DEFAULT_MAX_MESSAGE_SIZE,
+            resolver: None,
+            spf_enforce: false,
         }
     }
 
@@ -168,6 +177,8 @@ impl Server {
                 None
             }
         };
+        // The same resolver also backs inbound SPF.
+        self.resolver = Some(Arc::clone(&resolver));
         self.relay = Some(RelayContext {
             resolver,
             spool,
@@ -176,6 +187,35 @@ impl Server {
             tls,
         });
         self
+    }
+
+    /// Provide a DNS resolver for inbound message authentication (SPF) without
+    /// enabling outbound relay. [`Server::with_relay`] already sets one; this is
+    /// for SPF-only deployments and tests.
+    #[must_use]
+    pub fn with_resolver(mut self, resolver: Arc<dyn DnsResolver>) -> Self {
+        self.resolver = Some(resolver);
+        self
+    }
+
+    /// The resolver used for inbound authentication (SPF), if configured.
+    #[must_use]
+    pub fn resolver(&self) -> Option<Arc<dyn DnsResolver>> {
+        self.resolver.clone()
+    }
+
+    /// Enable hard SPF enforcement: a `Fail` result rejects the message. Default
+    /// is stamp-only (`Received-SPF` header, no rejection).
+    #[must_use]
+    pub fn with_spf_enforcement(mut self, enforce: bool) -> Self {
+        self.spf_enforce = enforce;
+        self
+    }
+
+    /// Whether an SPF `Fail` should reject the message (vs. stamp-only).
+    #[must_use]
+    pub fn spf_enforce(&self) -> bool {
+        self.spf_enforce
     }
 
     /// Override the relay connection port (no-op if relay is not enabled).

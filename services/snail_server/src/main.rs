@@ -12,6 +12,7 @@
 //! - `SNAIL_INBOUND_ADDR`      — inbound MX bind (default `127.0.0.1:2525`; `:25` in prod needs privilege)
 //! - `SNAIL_SPOOL_DIR`         — outbound relay queue (default `<data_dir>/spool`)
 //! - `SNAIL_TLS_CERT`/`SNAIL_TLS_KEY` — PEM cert+key paths for STARTTLS (self-signed generated if unset)
+//! - `SNAIL_SPF_ENFORCE`       — reject (550) inbound mail on SPF `Fail` (default off: stamp `Received-SPF` only)
 //!
 //! `SNAIL_DATA_DIR` / `SNAIL_LOG` are read via `utilities::Config`.
 
@@ -63,6 +64,16 @@ async fn main() -> anyhow::Result<()> {
             tracing::warn!(%error, "system DNS resolver unavailable; outbound relay disabled");
         }
     }
+
+    // Inbound SPF: stamp a `Received-SPF` header by default; when SNAIL_SPF_ENFORCE
+    // is truthy, an SPF `Fail` rejects the message (550) instead.
+    let spf_enforce = env_flag("SNAIL_SPF_ENFORCE");
+    server = server.with_spf_enforcement(spf_enforce);
+    tracing::info!(
+        spf_enforce,
+        spf = server.resolver().is_some(),
+        "inbound SPF configured"
+    );
 
     if let Ok(users) = std::env::var("SNAIL_USERS") {
         for entry in users.split(',').filter(|e| !e.trim().is_empty()) {
@@ -157,6 +168,17 @@ fn load_certs(domain: &str, inbound_addr: &str) -> anyhow::Result<MailCerts> {
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Read a boolean env flag: `1`, `true`, `yes`, or `on` (case-insensitive) are
+/// true; anything else (including unset) is false.
+fn env_flag(key: &str) -> bool {
+    std::env::var(key).is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 #[cfg(test)]

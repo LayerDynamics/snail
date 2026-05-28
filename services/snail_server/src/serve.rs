@@ -22,7 +22,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, Semaphore};
 use tokio_rustls::server::TlsStream;
 
-use crate::received::{MAX_RECEIVED_HOPS, received_header};
+use crate::received::{MAX_RECEIVED_HOPS, received_header, received_spf_header};
 use crate::server::{RelayAuthorization, Server};
 use crate::worker::spawn_relay_worker;
 
@@ -260,7 +260,7 @@ pub async fn serve_inbound_firewalled(
     server: Arc<Server>,
 ) -> std::io::Result<()> {
     match server.firewall().check(peer.ip()) {
-        Decision::Allow => serve_inbound(stream, server).await,
+        Decision::Allow => serve_inbound(stream, peer, server).await,
         Decision::Deny(reason) => {
             tracing::warn!(peer = %peer, ?reason, "inbound connection denied by firewall");
             let (_read, mut write) = stream.into_split();
@@ -449,7 +449,11 @@ pub async fn serve_submission(
 ///
 /// # Errors
 /// [`std::io::Error`] on socket failure or a failed TLS handshake.
-pub async fn serve_inbound(stream: TcpStream, server: Arc<Server>) -> std::io::Result<()> {
+pub async fn serve_inbound(
+    stream: TcpStream,
+    peer: SocketAddr,
+    server: Arc<Server>,
+) -> std::io::Result<()> {
     let tls = server.tls_config();
     let mut conn = BufReader::new(MaybeTlsStream::Plain(stream));
     let mut session = SmtpSession::new();
@@ -484,32 +488,69 @@ pub async fn serve_inbound(stream: TcpStream, server: Arc<Server>) -> std::io::R
                 } else {
                     "ESMTP"
                 };
-                let reply = match session.take_envelope() {
-                    Some(envelope) => match collector.into_message(envelope) {
-                        Ok(mut message) => {
-                            if message.received_header_count() >= MAX_RECEIVED_HOPS {
-                                // RFC 5321 §6.3 loop breaker: refuse rather than
-                                // relay/deliver a message that has looped.
+                let reply: &str = match session.take_envelope() {
+                    None => "554 no valid recipients\r\n",
+                    Some(envelope) => {
+                        let mail_from = envelope
+                            .sender
+                            .as_ref()
+                            .map(ToString::to_string)
+                            .unwrap_or_default();
+                        match collector.into_message(envelope) {
+                            Err(_) => "554 message parse error\r\n",
+                            Ok(message) if message.received_header_count() >= MAX_RECEIVED_HOPS => {
+                                // RFC 5321 §6.3 loop breaker: refuse a looping message
+                                // rather than deliver/relay it. (`message` is dropped.)
+                                let _ = message;
                                 "554 too many Received headers; possible mail loop\r\n"
-                            } else {
-                                // Stamp the trace hop. No-auth inbound: recipients
-                                // were vetted as local at RCPT time, and relay is
-                                // forbidden here regardless, so this delivers locally
-                                // and never relays.
-                                message.prepend_header(&received_header(
-                                    &helo,
-                                    server.host_name(),
-                                    proto,
-                                    SystemTime::now(),
-                                ));
-                                let _ =
-                                    server.accept_inbound(message, RelayAuthorization::Forbidden);
-                                "250 OK message accepted\r\n"
+                            }
+                            Ok(mut message) => {
+                                // SPF (RFC 7208): evaluate the connecting IP against
+                                // the MAIL FROM identity when a resolver is configured.
+                                let spf = match server.resolver() {
+                                    Some(resolver) => Some(
+                                        network::evaluate_spf(
+                                            resolver.as_ref(),
+                                            peer.ip(),
+                                            &helo,
+                                            &mail_from,
+                                        )
+                                        .await,
+                                    ),
+                                    None => None,
+                                };
+                                if matches!(spf, Some(network::SpfResult::Fail))
+                                    && server.spf_enforce()
+                                {
+                                    tracing::warn!(peer = %peer, %mail_from, "SPF fail; rejecting (enforcement enabled)");
+                                    "550 5.7.23 SPF validation failed\r\n"
+                                } else {
+                                    // Stamp Received-SPF (so DMARC can weigh it), then
+                                    // the trace hop. No-auth inbound: recipients were
+                                    // vetted local at RCPT time and relay is forbidden
+                                    // here, so this delivers locally and never relays.
+                                    if let Some(result) = spf {
+                                        message.prepend_header(&received_spf_header(
+                                            result.as_str(),
+                                            server.host_name(),
+                                            &peer.ip().to_string(),
+                                            &mail_from,
+                                            &helo,
+                                        ));
+                                    }
+                                    message.prepend_header(&received_header(
+                                        &helo,
+                                        server.host_name(),
+                                        proto,
+                                        SystemTime::now(),
+                                    ));
+                                    let _ = server
+                                        .accept_inbound(message, RelayAuthorization::Forbidden);
+                                    "250 OK message accepted\r\n"
+                                }
                             }
                         }
-                        Err(_) => "554 message parse error\r\n",
-                    },
-                    None => "554 no valid recipients\r\n",
+                    }
                 };
                 conn.write_all(reply.as_bytes()).await?;
             }
@@ -1024,8 +1065,8 @@ mod tests {
         {
             let srv = Arc::clone(&server);
             tokio::spawn(async move {
-                let (s, _) = inbound.accept().await.unwrap();
-                serve_inbound(s, srv).await.unwrap();
+                let (s, peer) = inbound.accept().await.unwrap();
+                serve_inbound(s, peer, srv).await.unwrap();
             });
         }
 
@@ -1073,8 +1114,8 @@ mod tests {
         {
             let srv = Arc::clone(&server);
             tokio::spawn(async move {
-                let (s, _) = inbound.accept().await.unwrap();
-                serve_inbound(s, srv).await.unwrap();
+                let (s, peer) = inbound.accept().await.unwrap();
+                serve_inbound(s, peer, srv).await.unwrap();
             });
         }
 
@@ -1425,8 +1466,8 @@ mod tests {
         {
             let srv = Arc::clone(&server);
             tokio::spawn(async move {
-                let (s, _) = inbound.accept().await.unwrap();
-                serve_inbound(s, srv).await.unwrap();
+                let (s, peer) = inbound.accept().await.unwrap();
+                serve_inbound(s, peer, srv).await.unwrap();
             });
         }
 
@@ -1484,8 +1525,8 @@ mod tests {
         {
             let srv = Arc::clone(&server);
             tokio::spawn(async move {
-                let (s, _) = inbound.accept().await.unwrap();
-                serve_inbound(s, srv).await.unwrap();
+                let (s, peer) = inbound.accept().await.unwrap();
+                serve_inbound(s, peer, srv).await.unwrap();
             });
         }
 
@@ -1540,8 +1581,8 @@ mod tests {
         {
             let srv = Arc::clone(&server);
             tokio::spawn(async move {
-                let (s, _) = inbound.accept().await.unwrap();
-                serve_inbound(s, srv).await.unwrap();
+                let (s, peer) = inbound.accept().await.unwrap();
+                serve_inbound(s, peer, srv).await.unwrap();
             });
         }
 
@@ -1735,8 +1776,8 @@ mod tests {
         {
             let srv = Arc::clone(&server);
             tokio::spawn(async move {
-                let (s, _) = inbound.accept().await.unwrap();
-                serve_inbound(s, srv).await.unwrap();
+                let (s, peer) = inbound.accept().await.unwrap();
+                serve_inbound(s, peer, srv).await.unwrap();
             });
         }
         {
@@ -1802,8 +1843,8 @@ mod tests {
         {
             let srv = Arc::clone(&server);
             tokio::spawn(async move {
-                let (s, _) = inbound.accept().await.unwrap();
-                serve_inbound(s, srv).await.unwrap();
+                let (s, peer) = inbound.accept().await.unwrap();
+                serve_inbound(s, peer, srv).await.unwrap();
             });
         }
         let client = TcpStream::connect(addr).await.unwrap();
@@ -1846,8 +1887,8 @@ mod tests {
         {
             let srv = Arc::clone(&server);
             tokio::spawn(async move {
-                let (s, _) = inbound.accept().await.unwrap();
-                serve_inbound(s, srv).await.unwrap();
+                let (s, peer) = inbound.accept().await.unwrap();
+                serve_inbound(s, peer, srv).await.unwrap();
             });
         }
         let client = TcpStream::connect(addr).await.unwrap();
@@ -1881,6 +1922,129 @@ mod tests {
         );
     }
 
+    /// A canned-TXT resolver for SPF integration tests.
+    struct SpfMock {
+        txt: std::collections::BTreeMap<String, Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl network::DnsResolver for SpfMock {
+        async fn lookup_mx(&self, _d: &str) -> network::Result<Vec<network::MxRecord>> {
+            Ok(vec![])
+        }
+        async fn lookup_ip(&self, _h: &str) -> network::Result<Vec<network::AddressRecord>> {
+            Ok(vec![])
+        }
+        async fn lookup_txt(&self, name: &str) -> network::Result<Vec<network::TxtRecord>> {
+            Ok(self
+                .txt
+                .get(name)
+                .map(|v| v.iter().cloned().map(network::TxtRecord).collect())
+                .unwrap_or_default())
+        }
+        async fn reverse_lookup(
+            &self,
+            _ip: std::net::IpAddr,
+        ) -> network::Result<Vec<network::PtrRecord>> {
+            Ok(vec![])
+        }
+    }
+
+    fn spf_mock(domain: &str, record: &str) -> Arc<SpfMock> {
+        let mut txt = std::collections::BTreeMap::new();
+        txt.insert(domain.to_string(), vec![record.to_string()]);
+        Arc::new(SpfMock { txt })
+    }
+
+    #[tokio::test]
+    async fn tcp_inbound_stamps_received_spf_when_resolver_present() {
+        // The sender domain authorizes the loopback connection → SPF pass, stamped
+        // as a Received-SPF header (stamp-only: the message is still delivered).
+        let server = Arc::new(
+            Server::new(&ServerConfig::new(["example.com".to_string()]))
+                .with_resolver(spf_mock("sender.test", "v=spf1 ip4:127.0.0.1/32 -all")),
+        );
+        let inbound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = inbound.local_addr().unwrap();
+        {
+            let srv = Arc::clone(&server);
+            tokio::spawn(async move {
+                let (s, peer) = inbound.accept().await.unwrap();
+                serve_inbound(s, peer, srv).await.unwrap();
+            });
+        }
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (cr, mut cw) = client.into_split();
+        let mut cr = BufReader::new(cr);
+        assert!(read_line(&mut cr).await.starts_with("220"));
+        for (cmd, expect) in [
+            ("EHLO mx.sender.test", "250"),
+            ("MAIL FROM:<alice@sender.test>", "250"),
+            ("RCPT TO:<bob@example.com>", "250"),
+            ("DATA", "354"),
+        ] {
+            cw.write_all(format!("{cmd}\r\n").as_bytes()).await.unwrap();
+            assert!(read_line(&mut cr).await.starts_with(expect), "cmd {cmd}");
+        }
+        cw.write_all(b"Subject: hi\r\n\r\nbody\r\n.\r\n")
+            .await
+            .unwrap();
+        assert!(read_line(&mut cr).await.starts_with("250"));
+
+        let stored = server.store().list("bob@example.com");
+        assert_eq!(stored.len(), 1);
+        let text = String::from_utf8_lossy(&stored[0].message.to_bytes()).into_owned();
+        assert!(
+            text.contains("Received-SPF: pass"),
+            "expected a Received-SPF: pass header, got: {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_inbound_rejects_on_spf_fail_when_enforcing() {
+        // The sender domain authorizes only 10.0.0.0/8, so the loopback connection
+        // is an SPF fail; with enforcement on, the message is refused (550).
+        let server = Arc::new(
+            Server::new(&ServerConfig::new(["example.com".to_string()]))
+                .with_resolver(spf_mock("sender.test", "v=spf1 ip4:10.0.0.0/8 -all"))
+                .with_spf_enforcement(true),
+        );
+        let inbound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = inbound.local_addr().unwrap();
+        {
+            let srv = Arc::clone(&server);
+            tokio::spawn(async move {
+                let (s, peer) = inbound.accept().await.unwrap();
+                serve_inbound(s, peer, srv).await.unwrap();
+            });
+        }
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (cr, mut cw) = client.into_split();
+        let mut cr = BufReader::new(cr);
+        assert!(read_line(&mut cr).await.starts_with("220"));
+        for (cmd, expect) in [
+            ("EHLO mx.sender.test", "250"),
+            ("MAIL FROM:<alice@sender.test>", "250"),
+            ("RCPT TO:<bob@example.com>", "250"),
+            ("DATA", "354"),
+        ] {
+            cw.write_all(format!("{cmd}\r\n").as_bytes()).await.unwrap();
+            assert!(read_line(&mut cr).await.starts_with(expect), "cmd {cmd}");
+        }
+        cw.write_all(b"Subject: spoof\r\n\r\nbody\r\n.\r\n")
+            .await
+            .unwrap();
+        assert!(
+            read_line(&mut cr).await.starts_with("550"),
+            "an SPF fail under enforcement must be rejected with 550"
+        );
+        assert_eq!(
+            server.store().count("bob@example.com"),
+            0,
+            "a rejected message must not be delivered"
+        );
+    }
+
     #[tokio::test]
     async fn inbound_starttls_refused_with_args_and_mid_transaction() {
         // STARTTLS now flows through the command parser + session state machine:
@@ -1897,8 +2061,8 @@ mod tests {
         {
             let srv = Arc::clone(&server);
             tokio::spawn(async move {
-                let (s, _) = inbound.accept().await.unwrap();
-                serve_inbound(s, srv).await.unwrap();
+                let (s, peer) = inbound.accept().await.unwrap();
+                serve_inbound(s, peer, srv).await.unwrap();
             });
         }
 
