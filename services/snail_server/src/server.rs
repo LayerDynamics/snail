@@ -84,6 +84,10 @@ pub struct Server {
     /// When `true`, an SPF `Fail` rejects the message (`550`); otherwise the result
     /// is only stamped in a `Received-SPF` header for DMARC to weigh (the default).
     spf_enforce: bool,
+    /// When `true`, a failing DMARC evaluation whose disposition is `reject` is
+    /// refused (`550`); otherwise the result is only stamped in
+    /// `Authentication-Results` (the default).
+    dmarc_enforce: bool,
 }
 
 impl Server {
@@ -112,6 +116,7 @@ impl Server {
             collector_max_size: DEFAULT_MAX_MESSAGE_SIZE,
             resolver: None,
             spf_enforce: false,
+            dmarc_enforce: false,
         }
     }
 
@@ -216,6 +221,20 @@ impl Server {
     #[must_use]
     pub fn spf_enforce(&self) -> bool {
         self.spf_enforce
+    }
+
+    /// Enable DMARC enforcement: a failing evaluation whose disposition is
+    /// `reject` is refused. Default is stamp-only (`Authentication-Results`).
+    #[must_use]
+    pub fn with_dmarc_enforcement(mut self, enforce: bool) -> Self {
+        self.dmarc_enforce = enforce;
+        self
+    }
+
+    /// Whether a DMARC `reject` disposition should refuse the message.
+    #[must_use]
+    pub fn dmarc_enforce(&self) -> bool {
+        self.dmarc_enforce
     }
 
     /// Override the relay connection port (no-op if relay is not enabled).

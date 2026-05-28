@@ -6,15 +6,17 @@
 //! tokio-rustls accept/connect.
 
 pub mod dkim;
+pub mod dmarc;
 pub mod dns;
 pub mod error;
 pub mod spf;
 pub mod tls;
 
 pub use dkim::{DkimOutcome, DkimResult, verify as verify_dkim};
+pub use dmarc::{DmarcDisposition, DmarcResult, evaluate as evaluate_dmarc};
 pub use dns::{
-    AddressRecord, DkimRecord, DmarcPolicy, DmarcRecord, DnsResolver, HickoryResolver, MxRecord,
-    PtrRecord, TxtRecord,
+    AddressRecord, AlignmentMode, DkimRecord, DmarcPolicy, DmarcRecord, DnsResolver,
+    HickoryResolver, MxRecord, PtrRecord, TxtRecord,
 };
 pub use error::{NetworkError, Result};
 pub use spf::{SpfResult, evaluate as evaluate_spf};

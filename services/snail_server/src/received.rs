@@ -73,6 +73,8 @@ pub fn authentication_results_header(
     spf: Option<SpfResult>,
     mail_from: &str,
     dkim: &[DkimOutcome],
+    dmarc_token: Option<&str>,
+    from_domain: &str,
 ) -> Vec<u8> {
     let from = if mail_from.is_empty() {
         "<>".to_string()
@@ -94,6 +96,12 @@ pub fn authentication_results_header(
                 sanitize(&outcome.domain)
             ));
         }
+    }
+    if let Some(token) = dmarc_token {
+        out.push_str(&format!(
+            "; dmarc={token} header.from={}",
+            sanitize(from_domain)
+        ));
     }
     out.into_bytes()
 }

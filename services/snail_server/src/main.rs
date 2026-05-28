@@ -13,6 +13,7 @@
 //! - `SNAIL_SPOOL_DIR`         — outbound relay queue (default `<data_dir>/spool`)
 //! - `SNAIL_TLS_CERT`/`SNAIL_TLS_KEY` — PEM cert+key paths for STARTTLS (self-signed generated if unset)
 //! - `SNAIL_SPF_ENFORCE`       — reject (550) inbound mail on SPF `Fail` (default off: stamp `Received-SPF` only)
+//! - `SNAIL_DMARC_ENFORCE`     — reject (550) inbound mail on a DMARC `reject` disposition (default off: stamp only)
 //!
 //! `SNAIL_DATA_DIR` / `SNAIL_LOG` are read via `utilities::Config`.
 
@@ -65,14 +66,20 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Inbound SPF: stamp a `Received-SPF` header by default; when SNAIL_SPF_ENFORCE
-    // is truthy, an SPF `Fail` rejects the message (550) instead.
+    // Inbound authentication: SPF + DKIM + DMARC are evaluated when a resolver is
+    // available and stamped into Received-SPF / Authentication-Results. By default
+    // they are advisory (stamp-only); SNAIL_SPF_ENFORCE rejects an SPF `Fail`, and
+    // SNAIL_DMARC_ENFORCE rejects a DMARC `reject` disposition.
     let spf_enforce = env_flag("SNAIL_SPF_ENFORCE");
-    server = server.with_spf_enforcement(spf_enforce);
+    let dmarc_enforce = env_flag("SNAIL_DMARC_ENFORCE");
+    server = server
+        .with_spf_enforcement(spf_enforce)
+        .with_dmarc_enforcement(dmarc_enforce);
     tracing::info!(
         spf_enforce,
-        spf = server.resolver().is_some(),
-        "inbound SPF configured"
+        dmarc_enforce,
+        auth = server.resolver().is_some(),
+        "inbound message authentication configured"
     );
 
     if let Ok(users) = std::env::var("SNAIL_USERS") {

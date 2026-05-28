@@ -12,7 +12,7 @@ pub mod txt;
 
 pub use a::AddressRecord;
 pub use dkim::DkimRecord;
-pub use dmark::{DmarcPolicy, DmarcRecord};
+pub use dmark::{AlignmentMode, DmarcPolicy, DmarcRecord};
 pub use lookup::DnsResolver;
 pub use manager::HickoryResolver;
 pub use mx::MxRecord;

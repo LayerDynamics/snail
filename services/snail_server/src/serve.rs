@@ -537,34 +537,90 @@ pub async fn serve_inbound(
                                         }
                                         None => Vec::new(),
                                     };
-                                    // Stamp Authentication-Results (SPF + DKIM, for DMARC),
-                                    // then Received-SPF, then the trace hop on top. No-auth
-                                    // inbound: recipients were vetted local at RCPT time and
-                                    // relay is forbidden here, so this delivers locally only.
-                                    message.prepend_header(&authentication_results_header(
-                                        server.host_name(),
-                                        spf,
-                                        &mail_from,
-                                        &dkim,
-                                    ));
-                                    if let Some(result) = spf {
-                                        message.prepend_header(&received_spf_header(
-                                            result.as_str(),
+
+                                    // DMARC (RFC 7489): align the From: domain against the
+                                    // SPF/DKIM results under the domain's published policy.
+                                    let from_domain = message
+                                        .headers
+                                        .get("From")
+                                        .and_then(from_header_domain)
+                                        .unwrap_or_default();
+                                    let spf_result = spf.unwrap_or(network::SpfResult::None);
+                                    let spf_domain = mail_from
+                                        .rsplit_once('@')
+                                        .map_or(helo.as_str(), |(_, d)| d);
+                                    let dkim_pass: Vec<&str> = dkim
+                                        .iter()
+                                        .filter(|o| o.result == network::DkimResult::Pass)
+                                        .map(|o| o.domain.as_str())
+                                        .collect();
+                                    let dmarc = match &resolver {
+                                        Some(r) if !from_domain.is_empty() => Some(
+                                            network::evaluate_dmarc(
+                                                r.as_ref(),
+                                                &from_domain,
+                                                spf_result,
+                                                spf_domain,
+                                                &dkim_pass,
+                                            )
+                                            .await,
+                                        ),
+                                        _ => None,
+                                    };
+                                    let dmarc_reject = server.dmarc_enforce()
+                                        && matches!(
+                                            dmarc.as_ref().map(|d| d.disposition),
+                                            Some(network::DmarcDisposition::Reject)
+                                        );
+
+                                    if dmarc_reject {
+                                        tracing::warn!(peer = %peer, %from_domain, "DMARC reject; refusing (enforcement enabled)");
+                                        "550 5.7.1 DMARC policy: message rejected\r\n"
+                                    } else {
+                                        // A quarantine disposition is recorded (and logged)
+                                        // but still delivered: Snail has no separate junk
+                                        // store, so the Authentication-Results header is how
+                                        // a client filters it. Routing to a junk folder is a
+                                        // future MDA enhancement.
+                                        if server.dmarc_enforce()
+                                            && matches!(
+                                                dmarc.as_ref().map(|d| d.disposition),
+                                                Some(network::DmarcDisposition::Quarantine)
+                                            )
+                                        {
+                                            tracing::warn!(peer = %peer, %from_domain, "DMARC quarantine (delivered; marked in Authentication-Results)");
+                                        }
+                                        // Stamp Authentication-Results (SPF + DKIM + DMARC),
+                                        // then Received-SPF, then the trace hop on top. No-auth
+                                        // inbound: recipients were vetted local at RCPT time and
+                                        // relay is forbidden here, so this delivers locally only.
+                                        message.prepend_header(&authentication_results_header(
                                             server.host_name(),
-                                            &peer.ip().to_string(),
+                                            spf,
                                             &mail_from,
-                                            &helo,
+                                            &dkim,
+                                            dmarc.as_ref().map(network::DmarcResult::as_str),
+                                            &from_domain,
                                         ));
+                                        if let Some(result) = spf {
+                                            message.prepend_header(&received_spf_header(
+                                                result.as_str(),
+                                                server.host_name(),
+                                                &peer.ip().to_string(),
+                                                &mail_from,
+                                                &helo,
+                                            ));
+                                        }
+                                        message.prepend_header(&received_header(
+                                            &helo,
+                                            server.host_name(),
+                                            proto,
+                                            SystemTime::now(),
+                                        ));
+                                        let _ = server
+                                            .accept_inbound(message, RelayAuthorization::Forbidden);
+                                        "250 OK message accepted\r\n"
                                     }
-                                    message.prepend_header(&received_header(
-                                        &helo,
-                                        server.host_name(),
-                                        proto,
-                                        SystemTime::now(),
-                                    ));
-                                    let _ = server
-                                        .accept_inbound(message, RelayAuthorization::Forbidden);
-                                    "250 OK message accepted\r\n"
                                 }
                             }
                         }
@@ -972,6 +1028,18 @@ impl SmtpReplyText {
     fn to_wire(&self) -> String {
         format!("{} {}\r\n", self.code, self.text)
     }
+}
+
+/// Extract the domain of the address in an RFC 5322 `From:` header value — the
+/// DMARC identifier. Handles both `Display Name <addr@domain>` and a bare
+/// `addr@domain`. Returns the lowercased domain, or `None` if no address is found.
+fn from_header_domain(value: &str) -> Option<String> {
+    let addr = match (value.rfind('<'), value.rfind('>')) {
+        (Some(l), Some(r)) if l < r => &value[l + 1..r],
+        _ => value.trim(),
+    };
+    let domain = addr.rsplit_once('@')?.1.trim().trim_end_matches('>').trim();
+    (!domain.is_empty()).then(|| domain.to_ascii_lowercase())
 }
 
 /// Case-insensitive `strip_prefix`.
@@ -1974,6 +2042,61 @@ mod tests {
         Arc::new(SpfMock { txt })
     }
 
+    /// A resolver with several canned TXT records (e.g. an SPF record plus a
+    /// `_dmarc.<domain>` record), for the DMARC integration tests.
+    fn auth_mock(records: &[(&str, &str)]) -> Arc<SpfMock> {
+        let mut txt = std::collections::BTreeMap::new();
+        for (name, value) in records {
+            txt.insert((*name).to_string(), vec![(*value).to_string()]);
+        }
+        Arc::new(SpfMock { txt })
+    }
+
+    /// Deliver one inbound message over a fresh `serve_inbound` connection and
+    /// return the verbatim stored bytes for `rcpt` plus the final SMTP reply.
+    async fn deliver_inbound(
+        server: Arc<Server>,
+        mail_from: &str,
+        rcpt: &str,
+        from_header: &str,
+        body: &str,
+    ) -> (String, String) {
+        let inbound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = inbound.local_addr().unwrap();
+        {
+            let srv = Arc::clone(&server);
+            tokio::spawn(async move {
+                let (s, peer) = inbound.accept().await.unwrap();
+                serve_inbound(s, peer, srv).await.unwrap();
+            });
+        }
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (cr, mut cw) = client.into_split();
+        let mut cr = BufReader::new(cr);
+        assert!(read_line(&mut cr).await.starts_with("220"));
+        for (cmd, expect) in [
+            ("EHLO mx.test".to_string(), "250"),
+            (format!("MAIL FROM:<{mail_from}>"), "250"),
+            (format!("RCPT TO:<{rcpt}>"), "250"),
+            ("DATA".to_string(), "354"),
+        ] {
+            cw.write_all(format!("{cmd}\r\n").as_bytes()).await.unwrap();
+            assert!(read_line(&mut cr).await.starts_with(expect), "cmd {cmd}");
+        }
+        cw.write_all(
+            format!("From: {from_header}\r\nSubject: hi\r\n\r\n{body}\r\n.\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+        let reply = read_line(&mut cr).await;
+        let stored = if reply.starts_with("250") {
+            String::from_utf8_lossy(&server.store().list(rcpt)[0].message.to_bytes()).into_owned()
+        } else {
+            String::new()
+        };
+        (reply, stored)
+    }
+
     #[tokio::test]
     async fn tcp_inbound_stamps_received_spf_when_resolver_present() {
         // The sender domain authorizes the loopback connection → SPF pass, stamped
@@ -2068,6 +2191,68 @@ mod tests {
             server.store().count("bob@example.com"),
             0,
             "a rejected message must not be delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_inbound_dmarc_pass_via_aligned_spf_is_stamped() {
+        // example.com publishes SPF (authorizing loopback) and a DMARC reject
+        // policy. A From: @example.com message whose MAIL FROM aligns passes DMARC.
+        let server = Arc::new(
+            Server::new(&ServerConfig::new(["example.com".to_string()])).with_resolver(auth_mock(
+                &[
+                    ("example.com", "v=spf1 ip4:127.0.0.1/32 -all"),
+                    ("_dmarc.example.com", "v=DMARC1; p=reject"),
+                ],
+            )),
+        );
+        let (reply, stored) = deliver_inbound(
+            server,
+            "alice@example.com",
+            "bob@example.com",
+            "Alice <alice@example.com>",
+            "hi",
+        )
+        .await;
+        assert!(
+            reply.starts_with("250"),
+            "aligned mail is delivered: {reply}"
+        );
+        assert!(
+            stored.contains("dmarc=pass header.from=example.com"),
+            "expected dmarc=pass in Authentication-Results, got: {stored:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_inbound_dmarc_reject_when_enforcing() {
+        // A spoofer at evil.test passes SPF for ITS OWN domain but sets
+        // From: @example.com. DMARC finds neither SPF nor DKIM aligned with the
+        // From domain; example.com's p=reject + enforcement refuses the message.
+        let server = Arc::new(
+            Server::new(&ServerConfig::new(["example.com".to_string()]))
+                .with_resolver(auth_mock(&[
+                    ("evil.test", "v=spf1 ip4:127.0.0.1/32 -all"),
+                    ("_dmarc.example.com", "v=DMARC1; p=reject"),
+                ]))
+                .with_dmarc_enforcement(true),
+        );
+        let (reply, _) = deliver_inbound(
+            Arc::clone(&server),
+            "attacker@evil.test",
+            "bob@example.com",
+            "alice@example.com", // spoofed From
+            "phish",
+        )
+        .await;
+        assert!(
+            reply.starts_with("550"),
+            "an unaligned message under a DMARC reject policy must be refused: {reply}"
+        );
+        assert_eq!(
+            server.store().count("bob@example.com"),
+            0,
+            "a DMARC-rejected message must not be delivered"
         );
     }
 
