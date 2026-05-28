@@ -24,14 +24,18 @@ impl PauseSwitch {
         Self::default()
     }
 
-    /// Pause enforcement (everything will be allowed).
-    pub fn pause(&self) {
-        self.paused.store(true, Ordering::SeqCst);
+    /// Pause enforcement (everything will be allowed). Returns `true` only when
+    /// this call actually transitioned the switch from enforcing to paused, so a
+    /// caller can audit the transition exactly once (idempotent re-pauses are
+    /// reported as `false`).
+    pub fn pause(&self) -> bool {
+        !self.paused.swap(true, Ordering::SeqCst)
     }
 
-    /// Resume enforcement.
-    pub fn resume(&self) {
-        self.paused.store(false, Ordering::SeqCst);
+    /// Resume enforcement. Returns `true` only when this call actually
+    /// transitioned the switch from paused to enforcing.
+    pub fn resume(&self) -> bool {
+        self.paused.swap(false, Ordering::SeqCst)
     }
 
     /// Whether enforcement is currently paused.
@@ -53,5 +57,14 @@ mod tests {
         assert!(s.is_paused());
         s.resume();
         assert!(!s.is_paused());
+    }
+
+    #[test]
+    fn reports_only_real_transitions() {
+        let s = PauseSwitch::new();
+        assert!(s.pause(), "first pause is a transition");
+        assert!(!s.pause(), "re-pausing is not a transition");
+        assert!(s.resume(), "first resume is a transition");
+        assert!(!s.resume(), "re-resuming is not a transition");
     }
 }

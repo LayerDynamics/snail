@@ -1,11 +1,20 @@
 //! The `CredentialStore` contract and the `Credential` value type.
 
+use zeroize::ZeroizeOnDrop;
+
 use crate::encryption::PasswordHasher;
 use crate::error::Result;
 
 /// A stored credential: a username, an Argon2 PHC password hash, and an optional
 /// `SecretCipher`-encrypted secret blob (e.g. a relay password / OAuth token).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The buffers are **wiped from memory on drop** ([`ZeroizeOnDrop`]). Note these
+/// fields hold a *hash* (`password_phc`) and *ciphertext* (`secret`), not raw
+/// plaintext — so this is defense-in-depth (reducing residual exposure in core
+/// dumps/swap), not protection of a recoverable secret. The recovered plaintext
+/// of `secret` is wiped separately by [`crate::SecretCipher::decrypt`] returning
+/// a `Zeroizing` buffer.
+#[derive(Debug, Clone, PartialEq, Eq, ZeroizeOnDrop)]
 pub struct Credential {
     /// The account username (lookup key).
     pub username: String,
@@ -66,4 +75,17 @@ pub trait CredentialStore: Send + Sync {
     /// # Errors
     /// [`crate::error::SecurityError::Hash`] if the stored PHC is malformed.
     fn verify_password(&self, username: &str, password: &str) -> Result<bool>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credential_zeroizes_on_drop() {
+        // Compile-time guarantee: secret-bearing credential buffers wipe on drop.
+        // If the derive is removed this fails to build.
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<Credential>();
+    }
 }

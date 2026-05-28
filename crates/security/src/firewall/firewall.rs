@@ -3,13 +3,14 @@
 
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use governor::RateLimiter;
 use governor::clock::{Clock, DefaultClock};
 use governor::middleware::NoOpMiddleware;
 use governor::state::keyed::DefaultKeyedStateStore;
 
+use crate::audit::{AuditEvent, AuditLog};
 use crate::firewall::allow::AllowList;
 use crate::firewall::block::BlockList;
 use crate::firewall::config::FirewallConfig;
@@ -52,6 +53,9 @@ pub struct Firewall<C: Clock = DefaultClock> {
     pause: PauseSwitch,
     /// `check` call counter driving amortised rate-limiter housekeeping.
     checks: AtomicU64,
+    /// Optional audit sink: when set, pause/resume transitions are recorded so the
+    /// (security-relevant) total bypass that `pause` enables is never silent.
+    audit: Option<Arc<AuditLog>>,
 }
 
 impl Firewall<DefaultClock> {
@@ -90,7 +94,16 @@ impl<C: Clock> Firewall<C> {
             trace: Mutex::new(DecisionTrace::new(config.trace_capacity)),
             pause: PauseSwitch::new(),
             checks: AtomicU64::new(0),
+            audit: None,
         }
+    }
+
+    /// Attach an audit sink so pause/resume transitions are recorded. Returns the
+    /// firewall for builder-style composition at the composition root.
+    #[must_use]
+    pub fn with_audit(mut self, audit: Arc<AuditLog>) -> Self {
+        self.audit = Some(audit);
+        self
     }
 
     /// Decide whether a connection from `ip` is permitted.
@@ -158,14 +171,26 @@ impl<C: Clock> Firewall<C> {
             .insert(ip);
     }
 
-    /// Pause enforcement (permit everything).
+    /// Pause enforcement (permit everything, including blocklisted IPs). The
+    /// transition is recorded to the audit sink (if configured) so this total
+    /// bypass is never silent. Re-pausing an already-paused firewall is a no-op
+    /// and emits nothing.
     pub fn pause(&self) {
-        self.pause.pause();
+        if self.pause.pause()
+            && let Some(audit) = &self.audit
+        {
+            audit.record(AuditEvent::FirewallPaused);
+        }
     }
 
-    /// Resume enforcement.
+    /// Resume enforcement. The transition is recorded to the audit sink (if
+    /// configured); re-resuming an already-enforcing firewall is a no-op.
     pub fn resume(&self) {
-        self.pause.resume();
+        if self.pause.resume()
+            && let Some(audit) = &self.audit
+        {
+            audit.record(AuditEvent::FirewallResumed);
+        }
     }
 
     /// Attempts recorded for `ip` so far.
@@ -282,6 +307,28 @@ mod tests {
         assert_eq!(fw.check(ip(9)), Decision::Allow);
         fw.resume();
         assert_eq!(fw.check(ip(9)), Decision::Deny(DenyReason::Blocklisted));
+    }
+
+    #[test]
+    fn pause_and_resume_emit_audit_events_once_per_transition() {
+        use crate::audit::{AuditConfig, AuditLog};
+        // The total bypass `pause` enables must not be silent: each real
+        // transition is recorded exactly once, and idempotent re-pauses/re-resumes
+        // record nothing.
+        let audit = Arc::new(AuditLog::new(&AuditConfig::default()));
+        let fw = Firewall::new(&FirewallConfig::default()).with_audit(Arc::clone(&audit));
+
+        fw.pause();
+        fw.pause(); // no-op: already paused
+        fw.resume();
+        fw.resume(); // no-op: already enforcing
+
+        let events = audit.recent();
+        assert_eq!(
+            events,
+            vec![AuditEvent::FirewallPaused, AuditEvent::FirewallResumed],
+            "exactly one event per real transition, in order"
+        );
     }
 
     #[test]

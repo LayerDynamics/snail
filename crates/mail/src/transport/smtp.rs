@@ -19,6 +19,10 @@ pub enum SmtpCommand {
     RcptTo(Mailbox),
     /// `DATA`
     Data,
+    /// `STARTTLS` — request a TLS upgrade (RFC 3207). The socket loop performs the
+    /// handshake; the session only validates sequencing (it must not interleave
+    /// with a mail transaction).
+    StartTls,
     /// `RSET`
     Rset,
     /// `NOOP`
@@ -49,6 +53,11 @@ impl SmtpCommand {
             "RSET" => Ok(Self::Rset),
             "NOOP" => Ok(Self::Noop),
             "QUIT" => Ok(Self::Quit),
+            // STARTTLS takes no argument: `STARTTLS junk` is malformed, not a bare
+            // STARTTLS (the previous raw-string match in the socket loop accepted
+            // any trailing text).
+            "STARTTLS" if rest.is_empty() => Ok(Self::StartTls),
+            "STARTTLS" => Err(MailError::Malformed("STARTTLS takes no arguments".into())),
             other => Err(MailError::Malformed(format!("unknown command `{other}`"))),
         }
     }
@@ -62,7 +71,15 @@ fn non_empty<'a>(s: &'a str, what: &str) -> Result<&'a str> {
     }
 }
 
-/// Parse `FROM:<addr>` / `TO:<addr>`. `<>` (the null path) yields `None`.
+/// Parse `FROM:<addr>` / `TO:<addr>`, tolerating trailing ESMTP parameters.
+/// `<>` (the null path) yields `None`.
+///
+/// The path is wrapped in `<>`; optional ESMTP parameters (RFC 1869 / RFC 5321
+/// §4.1.1.11) — e.g. `SIZE=12345`, `BODY=8BITMIME`, `ORCPT=...` — follow the
+/// closing `>`, whitespace-separated. We extract the address from `<...>` and
+/// **accept-and-ignore** any trailing parameters rather than rejecting the whole
+/// command. (The previous parser required the argument to *end* in `>`, so every
+/// ESMTP client sending `SIZE`/`BODY` got a spurious `500` — a real interop bug.)
 fn parse_path_opt(rest: &str, prefix: &str) -> Result<Option<Mailbox>> {
     let after = rest
         .strip_prefix(prefix)
@@ -71,7 +88,8 @@ fn parse_path_opt(rest: &str, prefix: &str) -> Result<Option<Mailbox>> {
         .trim();
     let inner = after
         .strip_prefix('<')
-        .and_then(|s| s.strip_suffix('>'))
+        .and_then(|s| s.split_once('>'))
+        .map(|(addr, _params)| addr)
         .ok_or_else(|| MailError::Malformed("path must be wrapped in <>".into()))?;
     if inner.is_empty() {
         return Ok(None); // null reverse-path
@@ -179,6 +197,13 @@ impl SmtpSession {
         self.phase
     }
 
+    /// The client's most recent `HELO`/`EHLO` domain argument, if any. Used to
+    /// stamp the `Received:` trace header at reception.
+    #[must_use]
+    pub fn helo(&self) -> Option<&str> {
+        self.helo.as_deref()
+    }
+
     /// Handle a command, advancing state and returning the reply to send. When
     /// `DATA` is accepted the phase becomes [`Phase::Data`]; the caller then
     /// reads body lines and calls [`Self::take_envelope`] for the result.
@@ -224,6 +249,18 @@ impl SmtpSession {
                 self.phase = Phase::Data;
                 SmtpReply::new(354, "Start mail input; end with <CRLF>.<CRLF>")
             }
+            // STARTTLS is connection-level: the socket loop performs the actual
+            // handshake and then resets the session. The state machine only
+            // enforces sequencing — permitted before a mail transaction begins
+            // (greeting or just-identified), refused once MAIL/RCPT/DATA is
+            // underway so it can never interleave with a transaction (RFC 3207).
+            (Phase::Greeting | Phase::Identified, SmtpCommand::StartTls) => {
+                SmtpReply::new(220, "Ready to start TLS")
+            }
+            (_, SmtpCommand::StartTls) => SmtpReply::new(
+                503,
+                "Bad sequence: STARTTLS not allowed during a mail transaction",
+            ),
             (_, SmtpCommand::MailFrom(_)) => SmtpReply::new(503, "Bad sequence: need EHLO first"),
             (_, SmtpCommand::RcptTo(_)) => {
                 SmtpReply::new(503, "Bad sequence: need MAIL FROM first")
@@ -267,6 +304,31 @@ mod tests {
         assert_eq!(SmtpCommand::parse("data").unwrap(), SmtpCommand::Data);
         assert!(SmtpCommand::parse("WIDGET now").is_err());
         assert!(SmtpCommand::parse("RCPT TO:<>").is_err()); // null forward-path invalid
+    }
+
+    #[test]
+    fn accepts_trailing_esmtp_parameters() {
+        // RFC 1869 ESMTP parameters after the closing `>` must be tolerated, not
+        // rejected as malformed — the previous parser required the arg to end in `>`.
+        assert_eq!(
+            SmtpCommand::parse("MAIL FROM:<a@b.com> SIZE=12345").unwrap(),
+            SmtpCommand::MailFrom(Some(Mailbox::parse("a@b.com").unwrap()))
+        );
+        assert_eq!(
+            SmtpCommand::parse("MAIL FROM:<a@b.com> SIZE=12345 BODY=8BITMIME").unwrap(),
+            SmtpCommand::MailFrom(Some(Mailbox::parse("a@b.com").unwrap()))
+        );
+        assert_eq!(
+            SmtpCommand::parse("RCPT TO:<b@y.com> ORCPT=rfc822;b@y.com").unwrap(),
+            SmtpCommand::RcptTo(Mailbox::parse("b@y.com").unwrap())
+        );
+        // The null sender still parses with a trailing parameter.
+        assert_eq!(
+            SmtpCommand::parse("MAIL FROM:<> SIZE=0").unwrap(),
+            SmtpCommand::MailFrom(None)
+        );
+        // A path that is never closed is still malformed.
+        assert!(SmtpCommand::parse("MAIL FROM:<a@b.com SIZE=1").is_err());
     }
 
     #[test]
@@ -321,6 +383,35 @@ mod tests {
             2,
             "only the accepted recipients remain"
         );
+    }
+
+    #[test]
+    fn starttls_parses_only_without_arguments() {
+        assert_eq!(
+            SmtpCommand::parse("STARTTLS").unwrap(),
+            SmtpCommand::StartTls
+        );
+        assert_eq!(
+            SmtpCommand::parse("starttls").unwrap(),
+            SmtpCommand::StartTls
+        );
+        // `STARTTLS junk` must be malformed, not silently treated as STARTTLS.
+        assert!(SmtpCommand::parse("STARTTLS junk").is_err());
+    }
+
+    #[test]
+    fn starttls_allowed_before_transaction_refused_during() {
+        let mut s = SmtpSession::new();
+        // Before identifying: allowed.
+        assert_eq!(s.handle(SmtpCommand::StartTls).code, 220);
+        s.handle(SmtpCommand::parse("EHLO x").unwrap());
+        // Just identified, no transaction: still allowed.
+        assert_eq!(s.handle(SmtpCommand::StartTls).code, 220);
+        // Begin a transaction, then STARTTLS must be refused (no interleaving).
+        s.handle(SmtpCommand::parse("MAIL FROM:<a@x.com>").unwrap());
+        assert_eq!(s.handle(SmtpCommand::StartTls).code, 503);
+        s.handle(SmtpCommand::parse("RCPT TO:<b@y.com>").unwrap());
+        assert_eq!(s.handle(SmtpCommand::StartTls).code, 503);
     }
 
     #[test]

@@ -23,11 +23,28 @@ pub struct Mailbox {
 impl Mailbox {
     /// Parse `local@domain`. Splits on the last `@`; both parts must be non-empty.
     ///
+    /// A leading source route (RFC 5321 §4.1.1.3, e.g. `@hop1,@hop2:user@domain`)
+    /// is **stripped and ignored**: the spec directs a receiver to accept the
+    /// final relayed mailbox and discard the deprecated route. Stripping it here
+    /// means a route can never leak into routing decisions or be re-emitted on an
+    /// outbound `RCPT TO:<...>`/`MAIL FROM:<...>` line as a malformed command. A
+    /// route with no terminating `:` and address is rejected as malformed.
+    ///
     /// # Errors
-    /// [`MailError::InvalidAddress`] if there is no `@` or either side is empty.
+    /// [`MailError::InvalidAddress`] if there is no `@`, either side is empty, or a
+    /// source route is present but not terminated by `:<addr-spec>`.
     pub fn parse(addr: &str) -> Result<Self> {
         let trimmed = addr.trim();
-        let (local, domain) = trimmed
+        let addr_spec = match trimmed.strip_prefix('@') {
+            // Source route: discard everything up to and including the route's
+            // terminating colon, keeping only the final `local@domain`.
+            Some(route) => route
+                .split_once(':')
+                .map(|(_route_hops, addr_spec)| addr_spec)
+                .ok_or_else(|| MailError::InvalidAddress(trimmed.to_string()))?,
+            None => trimmed,
+        };
+        let (local, domain) = addr_spec
             .rsplit_once('@')
             .ok_or_else(|| MailError::InvalidAddress(trimmed.to_string()))?;
         if local.is_empty() || domain.is_empty() || domain.contains('@') {
@@ -110,14 +127,27 @@ impl Headers {
 
 /// A parsed message: the SMTP [`Envelope`], the RFC 5322 [`Headers`], and the
 /// raw body bytes.
+///
+/// **Byte fidelity:** an MTA must relay and store bytes verbatim — lossily
+/// re-encoding a message corrupts legacy-charset headers and 8-bit/binary MIME
+/// parts and **breaks DKIM signatures**. So the original header and body bytes
+/// are retained exactly ([`Self::to_bytes`] reproduces the input byte-for-byte);
+/// the parsed [`headers`](Self::headers) are only a convenience *lookup view*
+/// (decoded leniently) and are never used to reconstruct the wire form.
 #[derive(Debug, Clone)]
 pub struct Message {
     /// SMTP routing envelope.
     pub envelope: Envelope,
-    /// Parsed headers.
+    /// Parsed headers — a **lookup view only** (subject, message-id, …), decoded
+    /// leniently for non-UTF-8 input. Not the wire form: use [`Self::to_bytes`]
+    /// for any serialization, relay, or DKIM purpose.
     pub headers: Headers,
-    /// Raw body (everything after the header/body separator).
+    /// Raw body bytes (everything after the header/body separator), verbatim.
     pub body: Vec<u8>,
+    /// Verbatim header section **including** the blank-line separator, so
+    /// [`Self::to_bytes`] = `raw_head + body` reproduces the input exactly,
+    /// independent of CRLF/LF style.
+    raw_head: Vec<u8>,
 }
 
 impl Message {
@@ -128,29 +158,65 @@ impl Message {
     /// # Errors
     /// [`MailError::Malformed`] if a header line lacks a `:` separator.
     pub fn parse(envelope: Envelope, raw: &[u8]) -> Result<Self> {
-        let (header_bytes, body) = split_header_body(raw);
+        let (header_bytes, body_start) = split_header_body(raw);
+        // Lenient decode only for the parsed lookup view; the wire bytes below are
+        // kept verbatim.
         let header_text = String::from_utf8_lossy(header_bytes);
         let headers = parse_headers(&header_text)?;
         Ok(Self {
             envelope,
             headers,
-            body: body.to_vec(),
+            body: raw[body_start..].to_vec(),
+            raw_head: raw[..body_start].to_vec(),
         })
     }
 
-    /// Serialize to wire bytes: `Name: value` headers, a blank line, then the body.
+    /// Serialize to wire bytes, **byte-for-byte** as received: the verbatim header
+    /// section (including its blank-line separator) followed by the verbatim body.
+    /// No re-encoding or header reformatting, so non-UTF-8 content and DKIM
+    /// signatures survive a relay round-trip intact.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        for (name, value) in self.headers.iter() {
-            out.extend_from_slice(name.as_bytes());
-            out.extend_from_slice(b": ");
-            out.extend_from_slice(value.as_bytes());
-            out.extend_from_slice(b"\r\n");
-        }
-        out.extend_from_slice(b"\r\n");
+        let mut out = Vec::with_capacity(self.raw_head.len() + self.body.len());
+        out.extend_from_slice(&self.raw_head);
         out.extend_from_slice(&self.body);
         out
+    }
+
+    /// The verbatim header section (including the trailing blank-line separator).
+    /// Useful for embedding the original headers in a DSN bounce.
+    #[must_use]
+    pub fn raw_headers(&self) -> &[u8] {
+        &self.raw_head
+    }
+
+    /// Prepend a trace header line (e.g. `Received: …`) ahead of all existing
+    /// headers, in place, preserving every other byte. The caller supplies the
+    /// header *without* a trailing CRLF.
+    pub fn prepend_header(&mut self, line: &[u8]) {
+        let mut head = Vec::with_capacity(line.len() + 2 + self.raw_head.len());
+        head.extend_from_slice(line);
+        head.extend_from_slice(b"\r\n");
+        head.extend_from_slice(&self.raw_head);
+        self.raw_head = head;
+    }
+
+    /// Number of `Received:` trace headers already present (RFC 5321 §6.3 hop
+    /// count). Counts the verbatim header section so it reflects the bytes on the
+    /// wire, not just the lenient lookup view.
+    #[must_use]
+    pub fn received_header_count(&self) -> usize {
+        let head = String::from_utf8_lossy(&self.raw_head);
+        head.lines()
+            .filter(|line| {
+                // A header field starts at column 0 (continuation lines are folded
+                // with leading whitespace); match the `Received:` field name.
+                !line.starts_with([' ', '\t'])
+                    && line
+                        .split_once(':')
+                        .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("Received"))
+            })
+            .count()
     }
 
     /// The `Subject` header, if present.
@@ -166,15 +232,18 @@ impl Message {
     }
 }
 
-/// Split raw bytes into the header section and body on the first blank line
-/// (`\r\n\r\n` or `\n\n`). If there is no blank line, all of it is headers.
-fn split_header_body(raw: &[u8]) -> (&[u8], &[u8]) {
+/// Split raw bytes on the first blank line (`\r\n\r\n` or `\n\n`), returning the
+/// header section (for parsing the lookup view) and the index at which the body
+/// begins. If there is no blank line, all of it is headers and the body is empty.
+/// Returning an index (not a body slice) lets the caller keep the separator bytes
+/// in the verbatim header section, so reconstruction is byte-exact.
+fn split_header_body(raw: &[u8]) -> (&[u8], usize) {
     if let Some(pos) = find_subslice(raw, b"\r\n\r\n") {
-        (&raw[..pos], &raw[pos + 4..])
+        (&raw[..pos], pos + 4)
     } else if let Some(pos) = find_subslice(raw, b"\n\n") {
-        (&raw[..pos], &raw[pos + 2..])
+        (&raw[..pos], pos + 2)
     } else {
-        (raw, &[])
+        (raw, raw.len())
     }
 }
 
@@ -274,6 +343,28 @@ mod tests {
     }
 
     #[test]
+    fn source_route_is_stripped_to_final_mailbox() {
+        // RFC 5321 §4.1.1.3: accept the relayed mailbox, ignore the route. The
+        // route must never survive into the parsed local part or be re-emitted.
+        let m = Mailbox::parse("@hop1,@hop2:user@dom").unwrap();
+        assert_eq!(m.local, "user");
+        assert_eq!(m.domain, "dom");
+        assert_eq!(m.to_string(), "user@dom");
+        // A single-hop route is handled identically.
+        let m = Mailbox::parse("@relay.example:bob@example.com").unwrap();
+        assert_eq!(m.to_string(), "bob@example.com");
+    }
+
+    #[test]
+    fn malformed_source_route_without_address_is_rejected() {
+        // Previously `@hop1,@hop2` parsed as local=`hop1,` domain=`hop2` (the bug);
+        // with no terminating `:` + addr-spec it must be rejected, not accepted.
+        assert!(Mailbox::parse("@hop1,@hop2").is_err());
+        assert!(Mailbox::parse("@hop1:").is_err()); // route ends but no addr-spec
+        assert!(Mailbox::parse("@hop1:@dom").is_err()); // addr-spec has empty local
+    }
+
+    #[test]
     fn parses_headers_and_body() {
         let raw = b"Subject: Hello\r\nFrom: alice@example.com\r\n\r\nthe body\r\n";
         let msg = Message::parse(envelope(), raw).unwrap();
@@ -298,6 +389,48 @@ mod tests {
         assert_eq!(reparsed.subject(), Some("Hi"));
         assert_eq!(reparsed.message_id(), Some("<abc@x>"));
         assert_eq!(reparsed.body, b"body text");
+    }
+
+    #[test]
+    fn to_bytes_is_byte_identical_to_input() {
+        // Verbatim serialization: even with unusual (but valid) header whitespace,
+        // a folded continuation, and a CRLF body, to_bytes must reproduce the exact
+        // input bytes — no header reformatting (which would break DKIM).
+        let raw = b"Subject:no-space\r\nX-Folded: a\r\n  continued\r\nFrom: a@b\r\n\r\nline1\r\nline2\r\n";
+        let msg = Message::parse(envelope(), raw).unwrap();
+        assert_eq!(
+            msg.to_bytes(),
+            raw,
+            "to_bytes must be byte-for-byte verbatim"
+        );
+    }
+
+    #[test]
+    fn preserves_non_utf8_header_and_body_bytes() {
+        // The #4 regression: a lossy UTF-8 round-trip would turn 0xE9/0xFF/0xFE
+        // into U+FFFD (EF BF BD) and corrupt legacy-charset mail / break DKIM.
+        let raw = b"Subject: caf\xe9\r\nX-Bin: \xff\xfe\r\n\r\nbody \xe9\xff\xfe end\r\n";
+        let msg = Message::parse(envelope(), raw).unwrap();
+        assert_eq!(
+            msg.to_bytes(),
+            raw,
+            "non-UTF-8 header and body bytes must survive verbatim"
+        );
+    }
+
+    #[test]
+    fn prepend_header_adds_a_top_trace_header_verbatim() {
+        let raw = b"Subject: Hi\r\n\r\nbody";
+        let mut msg = Message::parse(envelope(), raw).unwrap();
+        assert_eq!(msg.received_header_count(), 0);
+        msg.prepend_header(b"Received: from a by b; date");
+        assert_eq!(
+            msg.to_bytes(),
+            b"Received: from a by b; date\r\nSubject: Hi\r\n\r\nbody"
+        );
+        assert_eq!(msg.received_header_count(), 1);
+        // The body is untouched by prepending.
+        assert_eq!(msg.body, b"body");
     }
 
     #[test]

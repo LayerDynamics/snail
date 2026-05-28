@@ -8,8 +8,8 @@ use std::sync::Arc;
 use filter::SpamFilter;
 use identity::{Account, Authenticator};
 use mail::{
-    DEFAULT_MAX_MESSAGE_SIZE, Envelope, Headers, InboundResult, MailCerts, MailDeliveryAgent,
-    Mailbox, MemoryMailStore, Message, Mta,
+    DEFAULT_MAX_MESSAGE_SIZE, Envelope, InboundResult, MailCerts, MailDeliveryAgent, Mailbox,
+    MemoryMailStore, Message, Mta,
 };
 use network::DnsResolver;
 use security::{
@@ -237,6 +237,13 @@ impl Server {
         &self.store
     }
 
+    /// This server's own host name (the primary local domain), used for the `by`
+    /// clause of the `Received:` trace header it stamps on inbound mail.
+    #[must_use]
+    pub fn host_name(&self) -> &str {
+        &self.helo
+    }
+
     /// Accept an inbound message: deliver to local recipients (scanned by the
     /// spam filter) and, when outbound relay is enabled **and** the connection is
     /// authorized to relay, queue any remote recipients onto the durable spool
@@ -270,13 +277,12 @@ impl Server {
             }
             return result;
         };
-        // Only the relay-enabled path needs the message parts cloned for the spool.
-        let sender = message.envelope.sender.clone();
-        let headers = message.headers.clone();
-        let body = message.body.clone();
+        // Only the relay-enabled path needs the message cloned (verbatim) for the
+        // spool, before the MDA consumes it for local delivery.
+        let source = message.clone();
         let result = self.mta.accept_inbound(message);
         if !result.relay.is_empty() {
-            enqueue_relay(relay, &sender, &headers, &body, &result.relay);
+            enqueue_relay(relay, &source, &result.relay);
         }
         result
     }
@@ -298,13 +304,7 @@ impl Server {
 /// [`Server::accept_inbound`] is the sole caller and gates on that; do not call
 /// this from any path that has not established relay authorization, or Snail
 /// becomes an open relay.
-fn enqueue_relay(
-    relay: &RelayContext,
-    sender: &Option<Mailbox>,
-    headers: &Headers,
-    body: &[u8],
-    recipients: &[Mailbox],
-) {
+fn enqueue_relay(relay: &RelayContext, source: &Message, recipients: &[Mailbox]) {
     let mut by_domain: BTreeMap<String, Vec<Mailbox>> = BTreeMap::new();
     for rcpt in recipients {
         by_domain
@@ -313,11 +313,10 @@ fn enqueue_relay(
             .push(rcpt.clone());
     }
     for (domain, rcpts) in by_domain {
-        let message = Message {
-            envelope: Envelope::new(sender.clone(), rcpts),
-            headers: headers.clone(),
-            body: body.to_vec(),
-        };
+        // Clone the source message verbatim (preserving its exact wire bytes — so
+        // DKIM survives relay) and narrow the envelope to this domain's recipients.
+        let mut message = source.clone();
+        message.envelope = Envelope::new(source.envelope.sender.clone(), rcpts);
         match relay.spool.enqueue(&message) {
             Ok(id) => tracing::info!(id = %id, domain = %domain, "queued message for relay"),
             Err(error) => tracing::error!(domain = %domain, %error, "failed to enqueue relay"),
@@ -370,7 +369,8 @@ mod tests {
         assert_eq!(pop.state(), PopState::Transaction);
         let retr = pop.handle(PopCommand::Retr(1));
         assert!(retr.ok);
-        assert!(retr.lines.iter().any(|l| l.contains("Hi Bob")));
+        let body = retr.body.expect("RETR returns the raw message bytes");
+        assert!(String::from_utf8_lossy(&body).contains("Hi Bob"));
     }
 
     #[test]

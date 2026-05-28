@@ -69,16 +69,21 @@ impl PopCommand {
     }
 }
 
-/// A POP3 reply: `+OK`/`-ERR` status, an optional one-line message, and optional
-/// multi-line payload (e.g. a retrieved message or a listing).
+/// A POP3 reply: `+OK`/`-ERR` status, an optional one-line message, an optional
+/// text multi-line payload (e.g. a `LIST` scan listing), and an optional **raw
+/// binary body** (`RETR`) emitted verbatim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PopReply {
     /// Whether this is a `+OK` (true) or `-ERR` (false) reply.
     pub ok: bool,
     /// The status-line message.
     pub message: String,
-    /// Multi-line payload lines (RETR/LIST), if any.
+    /// Multi-line text payload (e.g. `LIST`/`CAPA`), if any.
     pub lines: Vec<String>,
+    /// Raw message bytes for a `RETR` response, emitted verbatim (dot-stuffed by
+    /// the socket layer). Carried as bytes so 8-bit/binary content is never
+    /// corrupted by a lossy UTF-8 decode. Mutually exclusive with `lines`.
+    pub body: Option<Vec<u8>>,
 }
 
 impl PopReply {
@@ -87,6 +92,7 @@ impl PopReply {
             ok: true,
             message: message.into(),
             lines: Vec::new(),
+            body: None,
         }
     }
     fn err(message: impl Into<String>) -> Self {
@@ -94,6 +100,7 @@ impl PopReply {
             ok: false,
             message: message.into(),
             lines: Vec::new(),
+            body: None,
         }
     }
 }
@@ -270,10 +277,9 @@ impl<'a, A: SessionAuth, S: MailStore> Pop3Session<'a, A, S> {
                 Some(m) => {
                     let bytes = m.message.to_bytes();
                     let mut reply = PopReply::ok(format!("{} octets", bytes.len()));
-                    reply.lines = String::from_utf8_lossy(&bytes)
-                        .split("\r\n")
-                        .map(ToString::to_string)
-                        .collect();
+                    // Carry the raw bytes verbatim; the socket layer dot-stuffs and
+                    // frames them. A lossy decode here would corrupt 8-bit content.
+                    reply.body = Some(bytes);
                     reply
                 }
                 None => PopReply::err("no such message"),
@@ -360,7 +366,31 @@ mod tests {
         assert!(stat.message.starts_with("2 ")); // "2 <octets>"
         let retr = s.handle(PopCommand::Retr(1));
         assert!(retr.ok);
-        assert!(retr.lines.iter().any(|l| l.contains("Subject: m0")));
+        let body = retr.body.expect("RETR carries the raw message bytes");
+        assert!(String::from_utf8_lossy(&body).contains("Subject: m0"));
+    }
+
+    #[test]
+    fn retr_preserves_non_utf8_message_bytes_verbatim() {
+        // The #4 regression: RETR must return the message bytes unchanged, not a
+        // lossy UTF-8 round-trip (which would replace 8-bit bytes with U+FFFD).
+        let auth = auth();
+        let store = MemoryMailStore::new();
+        let msg = Message::parse(
+            Envelope::new(None, vec![Mailbox::parse("bob@example.com").unwrap()]),
+            b"Subject: bin\r\n\r\nbody \xff\xfe \xe9 end",
+        )
+        .unwrap();
+        store.deliver("bob@example.com", msg);
+        let mut s = Pop3Session::new(&auth, &store);
+        s.handle(PopCommand::User("bob@example.com".into()));
+        s.handle(PopCommand::Pass("pw".into()));
+
+        let retr = s.handle(PopCommand::Retr(1));
+        let body = retr.body.expect("RETR body");
+        assert_eq!(body, store.list("bob@example.com")[0].message.to_bytes());
+        assert!(body.windows(2).any(|w| w == b"\xff\xfe"));
+        assert!(!body.windows(3).any(|w| w == [0xEF, 0xBF, 0xBD]));
     }
 
     #[test]

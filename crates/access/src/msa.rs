@@ -82,6 +82,12 @@ impl<'a, A: SessionAuth> MsaSession<'a, A> {
     pub fn smtp_mut(&mut self) -> &mut SmtpSession {
         &mut self.smtp
     }
+
+    /// The client's `HELO`/`EHLO` domain, if any (for the `Received:` trace header).
+    #[must_use]
+    pub fn helo(&self) -> Option<&str> {
+        self.smtp.helo()
+    }
 }
 
 #[cfg(test)]

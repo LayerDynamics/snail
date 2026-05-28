@@ -106,11 +106,27 @@ fn unquote(s: &str) -> &str {
         .unwrap_or(s)
 }
 
-/// An IMAP response: zero or more untagged `*` lines plus a tagged status line.
+/// A binary `FETCH` literal: the verbatim message octets to emit as an IMAP
+/// `{N}` literal. Carried as raw bytes (not a `String`) so the announced length
+/// always equals the bytes written and non-UTF-8 / 8-bit content is never
+/// corrupted by a lossy decode (which previously desynced the literal length).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchLiteral {
+    /// The 1-based message sequence number.
+    pub seq: usize,
+    /// The verbatim message bytes ([`mail::Message::to_bytes`]).
+    pub octets: Vec<u8>,
+}
+
+/// An IMAP response: zero or more untagged `*` text lines, an optional binary
+/// `FETCH` literal, and a tagged status line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImapResponse {
     /// Untagged response lines (without the leading `* `).
     pub untagged: Vec<String>,
+    /// An optional binary `FETCH` literal, written verbatim after the untagged
+    /// lines and before the tagged status (used for `RFC822`/`BODY[]`).
+    pub fetch_literal: Option<FetchLiteral>,
     /// The tagged status line (e.g. `A1 OK LOGIN completed`).
     pub status: String,
 }
@@ -193,10 +209,12 @@ impl<'a, A: SessionAuth, S: MailStore> ImapSession<'a, A, S> {
         let tag = tagged.tag;
         let ok = |status: &str| ImapResponse {
             untagged: Vec::new(),
+            fetch_literal: None,
             status: format!("{tag} OK {status}"),
         };
         let no = |status: &str| ImapResponse {
             untagged: Vec::new(),
+            fetch_literal: None,
             status: format!("{tag} NO {status}"),
         };
         match tagged.command {
@@ -210,6 +228,7 @@ impl<'a, A: SessionAuth, S: MailStore> ImapSession<'a, A, S> {
                 }
                 ImapResponse {
                     untagged: vec![caps],
+                    fetch_literal: None,
                     status: format!("{tag} OK CAPABILITY completed"),
                 }
             }
@@ -228,6 +247,7 @@ impl<'a, A: SessionAuth, S: MailStore> ImapSession<'a, A, S> {
                 self.state = ImapState::NotAuthenticated;
                 ImapResponse {
                     untagged: vec!["BYE Snail logging out".to_string()],
+                    fetch_literal: None,
                     status: format!("{tag} OK LOGOUT completed"),
                 }
             }
@@ -255,11 +275,13 @@ impl<'a, A: SessionAuth, S: MailStore> ImapSession<'a, A, S> {
                         format!("{} EXISTS", self.selected.len()),
                         "FLAGS (\\Seen \\Deleted)".to_string(),
                     ],
+                    fetch_literal: None,
                     status: format!("{tag} OK [READ-WRITE] SELECT completed"),
                 }
             }
             ImapCommand::List { .. } => ImapResponse {
                 untagged: vec!["LIST (\\HasNoChildren) \"/\" \"INBOX\"".to_string()],
+                fetch_literal: None,
                 status: format!("{tag} OK LIST completed"),
             },
             ImapCommand::Fetch { seq, item } => {
@@ -269,17 +291,24 @@ impl<'a, A: SessionAuth, S: MailStore> ImapSession<'a, A, S> {
                 match self.selected.get(seq.wrapping_sub(1)) {
                     Some(stored) => {
                         let bytes = stored.message.to_bytes();
-                        let untagged = match item {
-                            FetchItem::Size => format!("{seq} FETCH (RFC822.SIZE {})", bytes.len()),
-                            FetchItem::Full => format!(
-                                "{seq} FETCH (RFC822 {{{}}}\r\n{})",
-                                bytes.len(),
-                                String::from_utf8_lossy(&bytes)
-                            ),
-                        };
-                        ImapResponse {
-                            untagged: vec![untagged],
-                            status: format!("{tag} OK FETCH completed"),
+                        match item {
+                            // RFC822.SIZE is a plain numeric untagged line.
+                            FetchItem::Size => ImapResponse {
+                                untagged: vec![format!(
+                                    "{seq} FETCH (RFC822.SIZE {})",
+                                    bytes.len()
+                                )],
+                                fetch_literal: None,
+                                status: format!("{tag} OK FETCH completed"),
+                            },
+                            // RFC822/BODY[] returns the message as a binary literal:
+                            // the announced `{N}` must equal the bytes written, so
+                            // the octets are carried verbatim (no lossy decode).
+                            FetchItem::Full => ImapResponse {
+                                untagged: Vec::new(),
+                                fetch_literal: Some(FetchLiteral { seq, octets: bytes }),
+                                status: format!("{tag} OK FETCH completed"),
+                            },
                         }
                     }
                     None => no("no such message"),
@@ -351,7 +380,37 @@ mod tests {
         assert_eq!(s.state(), ImapState::Selected);
         let fetch = s.handle(TaggedCommand::parse("A3 FETCH 1 RFC822").unwrap());
         assert!(fetch.status.contains("OK"));
-        assert!(fetch.untagged[0].contains("Subject: m0"));
+        let lit = fetch
+            .fetch_literal
+            .expect("a full FETCH carries a binary literal");
+        assert!(String::from_utf8_lossy(&lit.octets).contains("Subject: m0"));
+    }
+
+    #[test]
+    fn fetch_literal_length_matches_octets_for_non_utf8_messages() {
+        // The #4 desync bug: the announced `{N}` literal length is the raw byte
+        // count, but the body had been lossily decoded — so for non-UTF-8 mail the
+        // declared length and the bytes sent disagreed. Now both are the same
+        // verbatim octets.
+        let store = MemoryMailStore::new();
+        let msg = Message::parse(
+            Envelope::new(None, vec![Mailbox::parse("bob@example.com").unwrap()]),
+            b"Subject: bin\r\n\r\nbody \xff\xfe \xe9 end",
+        )
+        .unwrap();
+        store.deliver("bob@example.com", msg);
+
+        let auth = StubAuth;
+        let mut s = ImapSession::new(&auth, &store);
+        login(&mut s);
+        s.handle(TaggedCommand::parse("A2 SELECT INBOX").unwrap());
+        let fetch = s.handle(TaggedCommand::parse("A3 FETCH 1 RFC822").unwrap());
+        let lit = fetch.fetch_literal.expect("full FETCH literal");
+        // The octets are exactly the stored message bytes — declared length == bytes.
+        let stored = store.list("bob@example.com");
+        assert_eq!(lit.octets, stored[0].message.to_bytes());
+        assert!(lit.octets.windows(2).any(|w| w == b"\xff\xfe"));
+        assert!(!lit.octets.windows(3).any(|w| w == [0xEF, 0xBF, 0xBD]));
     }
 
     #[test]

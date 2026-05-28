@@ -62,10 +62,14 @@ impl OutboundSpool {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
         fs::create_dir_all(dir.join("bounced"))?;
-        Ok(Self {
+        let spool = Self {
             dir,
             counter: AtomicU64::new(0),
-        })
+        };
+        // Finish any bounce interrupted by a crash before serving (so a half-moved
+        // entry is never stranded — see `bounce`).
+        spool.recover_interrupted_bounces()?;
+        Ok(spool)
     }
 
     /// Enqueue `message` for relay (attempts = 0, due immediately). Writes the
@@ -99,6 +103,9 @@ impl OutboundSpool {
             let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
+            if self.bouncing_marker(id).exists() {
+                continue; // mid-bounce; recovery (run at open) relocates it
+            }
             if !self.eml_path(id).exists() {
                 continue; // incomplete entry (crash between the two writes)
             }
@@ -151,15 +158,83 @@ impl OutboundSpool {
         Ok(())
     }
 
-    /// Move entry `id` into `bounced/` (permanent failure / attempts exhausted).
+    /// Move entry `id` into `bounced/` (permanent failure / attempts exhausted),
+    /// crash-safely.
+    ///
+    /// Moving two files is not atomic, so this drops a `<id>.bouncing` marker
+    /// **first**, relocates the `.eml` then the `.ctrl`, then removes the marker.
+    /// If the process crashes mid-move, the marker survives and
+    /// [`Self::recover_interrupted_bounces`] (run at [`Self::open`]) finishes the
+    /// relocation. Without this, a crash between the two renames stranded a `.ctrl`
+    /// in the main dir whose `.eml` had already moved — which [`Self::due_now`]
+    /// then skipped forever, silently losing the entry.
     ///
     /// # Errors
-    /// [`std::io::Error`] on a rename failure.
+    /// [`std::io::Error`] on a write/rename failure.
     pub fn bounce(&self, id: &str) -> io::Result<()> {
-        let bounced = self.dir.join("bounced");
-        fs::rename(self.eml_path(id), bounced.join(format!("{id}.eml")))?;
-        fs::rename(self.ctrl_path(id), bounced.join(format!("{id}.ctrl")))?;
+        let marker = self.bouncing_marker(id);
+        fs::write(&marker, id.as_bytes())?;
+        self.relocate_to_bounced(id)?;
+        remove_if_exists(&marker)
+    }
+
+    /// Complete any bounce left half-finished by a crash: for every `.bouncing`
+    /// marker, relocate whichever of the pair still sits in the main dir into
+    /// `bounced/`, then clear the marker.
+    fn recover_interrupted_bounces(&self) -> io::Result<()> {
+        for dirent in fs::read_dir(&self.dir)? {
+            let path = dirent?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("bouncing") {
+                continue;
+            }
+            let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            self.relocate_to_bounced(id)?;
+            remove_if_exists(&path)?;
+        }
         Ok(())
+    }
+
+    /// Move both files of entry `id` into `bounced/`. Idempotent: a file already
+    /// moved (now missing from the main dir) is skipped, so this is safe to re-run
+    /// during crash recovery.
+    fn relocate_to_bounced(&self, id: &str) -> io::Result<()> {
+        let bounced = self.dir.join("bounced");
+        rename_if_exists(&self.eml_path(id), &bounced.join(format!("{id}.eml")))?;
+        rename_if_exists(&self.ctrl_path(id), &bounced.join(format!("{id}.ctrl")))?;
+        Ok(())
+    }
+
+    /// Delete bounced entries whose files have not been modified within
+    /// `retention` (measured from `now`). Without this, `bounced/` grows without
+    /// bound — the finding's other half. Returns the number of files removed.
+    ///
+    /// # Errors
+    /// [`std::io::Error`] if the `bounced/` directory cannot be read.
+    pub fn reap_bounced(&self, retention: Duration, now: SystemTime) -> io::Result<usize> {
+        let bounced = self.dir.join("bounced");
+        let mut removed = 0;
+        for dirent in fs::read_dir(&bounced)? {
+            let path = dirent?.path();
+            if !path.is_file() {
+                continue;
+            }
+            let modified = fs::metadata(&path).and_then(|m| m.modified());
+            let aged_out = modified
+                .ok()
+                .and_then(|m| now.duration_since(m).ok())
+                .is_some_and(|age| age >= retention);
+            if aged_out {
+                remove_if_exists(&path)?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    fn bouncing_marker(&self, id: &str) -> PathBuf {
+        self.dir.join(format!("{id}.bouncing"))
     }
 
     fn new_id(&self) -> String {
@@ -205,6 +280,16 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 fn remove_if_exists(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Rename `src` to `dst`, treating an already-moved (`NotFound`) `src` as success
+/// so a relocation can be safely re-run during crash recovery.
+fn rename_if_exists(src: &Path, dst: &Path) -> io::Result<()> {
+    match fs::rename(src, dst) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
@@ -370,6 +455,83 @@ mod tests {
         );
         assert!(dir.join("bounced").join(format!("{id}.eml")).exists());
         assert!(dir.join("bounced").join(format!("{id}.ctrl")).exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn interrupted_bounce_is_completed_on_reopen_not_stranded() {
+        // Reproduce a crash *between* the two renames: the `.bouncing` marker is
+        // down and the `.eml` has moved into bounced/, but the `.ctrl` is still in
+        // the main dir. Before the fix, due_now skipped this `.ctrl` forever
+        // (its `.eml` was "missing"), silently losing the entry.
+        let (spool, dir) = temp_spool();
+        let id = spool.enqueue(&message()).unwrap();
+        drop(spool);
+
+        let bounced = dir.join("bounced");
+        fs::write(dir.join(format!("{id}.bouncing")), id.as_bytes()).unwrap();
+        fs::rename(
+            dir.join(format!("{id}.eml")),
+            bounced.join(format!("{id}.eml")),
+        )
+        .unwrap();
+        assert!(
+            dir.join(format!("{id}.ctrl")).exists(),
+            "the .ctrl is stranded in the main dir at crash time"
+        );
+
+        // Reopening recovers: the bounce is completed, nothing left in the main dir.
+        let reopened = OutboundSpool::open(&dir).unwrap();
+        assert!(
+            reopened
+                .due_now(SystemTime::now() + Duration::from_secs(1))
+                .unwrap()
+                .is_empty(),
+            "a half-bounced entry must not be revived as a due entry"
+        );
+        assert!(bounced.join(format!("{id}.eml")).exists());
+        assert!(bounced.join(format!("{id}.ctrl")).exists());
+        assert!(!dir.join(format!("{id}.ctrl")).exists(), "ctrl relocated");
+        assert!(
+            !dir.join(format!("{id}.bouncing")).exists(),
+            "marker cleared after recovery"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reap_bounced_removes_aged_entries_only() {
+        let (spool, dir) = temp_spool();
+        let id = spool.enqueue(&message()).unwrap();
+        spool.bounce(&id).unwrap();
+        let bounced = dir.join("bounced");
+        assert!(bounced.join(format!("{id}.eml")).exists());
+
+        // A long retention keeps a just-bounced entry; a zero retention reaps it.
+        let kept = spool
+            .reap_bounced(Duration::from_secs(3600), SystemTime::now())
+            .unwrap();
+        assert_eq!(kept, 0, "fresh bounced files are within retention");
+        assert!(bounced.join(format!("{id}.eml")).exists());
+
+        let reaped = spool
+            .reap_bounced(Duration::ZERO, SystemTime::now() + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(reaped, 2, "both .eml and .ctrl past retention are reaped");
+        assert!(!bounced.join(format!("{id}.eml")).exists());
+        assert!(!bounced.join(format!("{id}.ctrl")).exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bounce_leaves_no_marker_behind() {
+        let (spool, dir) = temp_spool();
+        let id = spool.enqueue(&message()).unwrap();
+        spool.bounce(&id).unwrap();
+        assert!(
+            !dir.join(format!("{id}.bouncing")).exists(),
+            "a completed bounce must remove its crash-recovery marker"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 

@@ -76,11 +76,10 @@ impl<S: MailStore, F: MessageFilter> Mta<S, F> {
         let local_outcome = if local.is_empty() {
             None
         } else {
-            let local_message = Message {
-                envelope: Envelope::new(message.envelope.sender.clone(), local),
-                headers: message.headers.clone(),
-                body: message.body.clone(),
-            };
+            // Clone the message verbatim (preserving its exact wire bytes) and
+            // narrow the envelope to just the local recipients.
+            let mut local_message = message.clone();
+            local_message.envelope = Envelope::new(message.envelope.sender.clone(), local);
             Some(self.mda.deliver(local_message))
         };
 

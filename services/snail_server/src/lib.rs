@@ -4,7 +4,9 @@
 //! the binary.
 
 pub mod config;
+pub mod dsn;
 pub mod outbound;
+pub mod received;
 pub mod serve;
 pub mod server;
 pub mod spool;

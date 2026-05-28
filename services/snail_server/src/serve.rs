@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use access::{
     ImapCommand, ImapResponse, ImapSession, MsaSession, Pop3Session, PopCommand, PopReply,
@@ -22,6 +22,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, Semaphore};
 use tokio_rustls::server::TlsStream;
 
+use crate::received::{MAX_RECEIVED_HOPS, received_header};
 use crate::server::{RelayAuthorization, Server};
 use crate::worker::spawn_relay_worker;
 
@@ -35,7 +36,7 @@ const MAX_LINE_LENGTH: usize = 64 * 1024;
 
 /// Outcome of a length-capped line read.
 enum LineRead {
-    /// A full line (terminator included, decoded lossily) was read into the buffer.
+    /// A full line (terminator included) was read into the buffer as raw bytes.
     Read,
     /// The peer closed the connection.
     Eof,
@@ -43,41 +44,41 @@ enum LineRead {
     TooLong,
 }
 
-/// Read one line (up to and including `\n`) into `buf`, never buffering more than
-/// `max` bytes. On overflow it stops and returns [`LineRead::TooLong`] **without
-/// draining the rest** — the caller closes the connection, so the unread bytes are
-/// abandoned with the socket (draining would re-introduce the unbounded read we
-/// are closing). Bytes are decoded with [`String::from_utf8_lossy`], so 8-bit
-/// input never aborts the connection with a UTF-8 error.
+/// Read one line (up to and including `\n`) into `buf` as **raw bytes**, never
+/// buffering more than `max` bytes. On overflow it stops and returns
+/// [`LineRead::TooLong`] **without draining the rest** — the caller closes the
+/// connection, so the unread bytes are abandoned with the socket (draining would
+/// re-introduce the unbounded read we are closing).
+///
+/// Bytes are kept verbatim (no UTF-8 decode): command lines are decoded leniently
+/// at the call site for parsing, while `DATA` body lines are fed to the collector
+/// as raw bytes so 8-bit/binary message content and DKIM signatures survive intact.
 async fn read_line_capped<R: AsyncBufReadExt + Unpin>(
     reader: &mut R,
-    buf: &mut String,
+    buf: &mut Vec<u8>,
     max: usize,
 ) -> std::io::Result<LineRead> {
     buf.clear();
-    let mut raw: Vec<u8> = Vec::new();
     loop {
         let chunk = reader.fill_buf().await?;
         if chunk.is_empty() {
-            if raw.is_empty() {
+            if buf.is_empty() {
                 return Ok(LineRead::Eof);
             }
             // EOF mid-line (no trailing newline): take what arrived.
-            buf.push_str(&String::from_utf8_lossy(&raw));
             return Ok(LineRead::Read);
         }
         let newline = chunk.iter().position(|&b| b == b'\n');
         let take = newline.map_or(chunk.len(), |p| p + 1);
-        if raw.len() + take > max {
-            let room = max - raw.len();
-            raw.extend_from_slice(&chunk[..room]);
+        if buf.len() + take > max {
+            let room = max - buf.len();
+            buf.extend_from_slice(&chunk[..room]);
             reader.consume(room);
             return Ok(LineRead::TooLong);
         }
-        raw.extend_from_slice(&chunk[..take]);
+        buf.extend_from_slice(&chunk[..take]);
         reader.consume(take);
         if newline.is_some() {
-            buf.push_str(&String::from_utf8_lossy(&raw));
             return Ok(LineRead::Read);
         }
     }
@@ -284,10 +285,9 @@ pub async fn serve_submission(
     let mut collecting: Option<InboundCollector> = None;
 
     conn.write_all(b"220 Snail ESMTP ready\r\n").await?;
-    let mut line = String::new();
+    let mut buf: Vec<u8> = Vec::new();
     loop {
-        line.clear();
-        match read_line_capped(&mut conn, &mut line, MAX_LINE_LENGTH).await? {
+        match read_line_capped(&mut conn, &mut buf, MAX_LINE_LENGTH).await? {
             LineRead::Read => {}
             LineRead::Eof => break,
             LineRead::TooLong => {
@@ -296,9 +296,9 @@ pub async fn serve_submission(
             }
         }
 
-        // DATA body mode: accumulate until the lone "." line.
+        // DATA body mode: accumulate raw bytes (verbatim) until the lone "." line.
         if let Some(collector) = collecting.as_mut() {
-            let done = collector.push_line(&line);
+            let done = collector.push_line(&buf);
             if collector.size_exceeded() {
                 conn.write_all(b"552 message exceeds the maximum size; closing\r\n")
                     .await?;
@@ -306,13 +306,30 @@ pub async fn serve_submission(
             }
             if done {
                 let collector = collecting.take().expect("collecting was Some");
+                let helo = msa.helo().unwrap_or("unknown").to_string();
+                let proto = if matches!(conn.get_ref(), MaybeTlsStream::Tls(_)) {
+                    "ESMTPSA"
+                } else {
+                    "ESMTPA"
+                };
                 let reply = match msa.smtp_mut().take_envelope() {
                     Some(envelope) => match collector.into_message(envelope) {
-                        Ok(message) => {
-                            // Authenticated submission: relaying to remote
-                            // recipients is permitted.
-                            let _ = server.accept_inbound(message, RelayAuthorization::Permitted);
-                            "250 OK message accepted\r\n"
+                        Ok(mut message) => {
+                            if message.received_header_count() >= MAX_RECEIVED_HOPS {
+                                "554 too many Received headers; possible mail loop\r\n"
+                            } else {
+                                // Stamp the trace hop, then submit. Relaying to
+                                // remote recipients is permitted on this path.
+                                message.prepend_header(&received_header(
+                                    &helo,
+                                    server.host_name(),
+                                    proto,
+                                    SystemTime::now(),
+                                ));
+                                let _ =
+                                    server.accept_inbound(message, RelayAuthorization::Permitted);
+                                "250 OK message accepted\r\n"
+                            }
                         }
                         Err(_) => "554 message parse error\r\n",
                     },
@@ -323,28 +340,10 @@ pub async fn serve_submission(
             continue;
         }
 
+        // Command mode: SMTP commands are ASCII, so a lenient decode is safe here
+        // (only DATA body bytes, handled verbatim above, must never be re-encoded).
+        let line = String::from_utf8_lossy(&buf);
         let trimmed = line.trim_end();
-
-        // STARTTLS: upgrade the socket and reset the session (the client must
-        // re-issue EHLO over the encrypted channel, per RFC 3207).
-        if trimmed.eq_ignore_ascii_case("STARTTLS") {
-            match server.tls_config() {
-                Some(config) if matches!(conn.get_ref(), MaybeTlsStream::Plain(_)) => {
-                    if !conn.buffer().is_empty() {
-                        conn.write_all(b"503 no pipelining before STARTTLS\r\n")
-                            .await?;
-                        continue;
-                    }
-                    conn.write_all(b"220 Ready to start TLS\r\n").await?;
-                    conn = accept_tls(conn, config).await?;
-                    msa = MsaSession::new(server.authenticator());
-                }
-                _ => {
-                    conn.write_all(b"502 STARTTLS not available\r\n").await?;
-                }
-            }
-            continue;
-        }
 
         // SASL PLAIN, initial-response form: `AUTH PLAIN <base64>`. When TLS is
         // on offer, refuse it in cleartext so credentials never cross unencrypted
@@ -381,6 +380,29 @@ pub async fn serve_submission(
         }
 
         match SmtpCommand::parse(&line) {
+            // STARTTLS: validated through the command parser (so `STARTTLS junk` is
+            // a 500, not a silent upgrade) and the session state machine (so it is
+            // refused mid-transaction). On success, upgrade the socket and reset the
+            // session — the client re-issues EHLO over the encrypted channel.
+            Ok(SmtpCommand::StartTls) => match server.tls_config() {
+                Some(config) if matches!(conn.get_ref(), MaybeTlsStream::Plain(_)) => {
+                    let reply = msa.handle(SmtpCommand::StartTls);
+                    if reply.code != 220 {
+                        conn.write_all(format!("{} {}\r\n", reply.code, reply.text).as_bytes())
+                            .await?;
+                    } else if !conn.buffer().is_empty() {
+                        conn.write_all(b"503 no pipelining before STARTTLS\r\n")
+                            .await?;
+                    } else {
+                        conn.write_all(b"220 Ready to start TLS\r\n").await?;
+                        conn = accept_tls(conn, config).await?;
+                        msa = MsaSession::new(server.authenticator());
+                    }
+                }
+                _ => {
+                    conn.write_all(b"502 STARTTLS not available\r\n").await?;
+                }
+            },
             // EHLO/HELO: advertise STARTTLS while plaintext with TLS available, or
             // AUTH once the channel is encrypted; a plain greeting when no TLS is
             // configured at all (so existing plaintext-only deployments still work).
@@ -434,10 +456,9 @@ pub async fn serve_inbound(stream: TcpStream, server: Arc<Server>) -> std::io::R
     let mut collecting: Option<InboundCollector> = None;
 
     conn.write_all(b"220 Snail ESMTP ready\r\n").await?;
-    let mut line = String::new();
+    let mut buf: Vec<u8> = Vec::new();
     loop {
-        line.clear();
-        match read_line_capped(&mut conn, &mut line, MAX_LINE_LENGTH).await? {
+        match read_line_capped(&mut conn, &mut buf, MAX_LINE_LENGTH).await? {
             LineRead::Read => {}
             LineRead::Eof => break,
             LineRead::TooLong => {
@@ -446,9 +467,10 @@ pub async fn serve_inbound(stream: TcpStream, server: Arc<Server>) -> std::io::R
             }
         }
 
-        // DATA body mode: accumulate until the lone "." line, then deliver.
+        // DATA body mode: accumulate raw bytes (verbatim) until the lone "." line,
+        // then deliver.
         if let Some(collector) = collecting.as_mut() {
-            let done = collector.push_line(&line);
+            let done = collector.push_line(&buf);
             if collector.size_exceeded() {
                 conn.write_all(b"552 message exceeds the maximum size; closing\r\n")
                     .await?;
@@ -456,14 +478,34 @@ pub async fn serve_inbound(stream: TcpStream, server: Arc<Server>) -> std::io::R
             }
             if done {
                 let collector = collecting.take().expect("collecting was Some");
+                let helo = session.helo().unwrap_or("unknown").to_string();
+                let proto = if matches!(conn.get_ref(), MaybeTlsStream::Tls(_)) {
+                    "ESMTPS"
+                } else {
+                    "ESMTP"
+                };
                 let reply = match session.take_envelope() {
                     Some(envelope) => match collector.into_message(envelope) {
-                        Ok(message) => {
-                            // No-auth inbound: recipients were vetted as local at
-                            // RCPT time, and relay is forbidden here regardless, so
-                            // this delivers locally and never relays.
-                            let _ = server.accept_inbound(message, RelayAuthorization::Forbidden);
-                            "250 OK message accepted\r\n"
+                        Ok(mut message) => {
+                            if message.received_header_count() >= MAX_RECEIVED_HOPS {
+                                // RFC 5321 §6.3 loop breaker: refuse rather than
+                                // relay/deliver a message that has looped.
+                                "554 too many Received headers; possible mail loop\r\n"
+                            } else {
+                                // Stamp the trace hop. No-auth inbound: recipients
+                                // were vetted as local at RCPT time, and relay is
+                                // forbidden here regardless, so this delivers locally
+                                // and never relays.
+                                message.prepend_header(&received_header(
+                                    &helo,
+                                    server.host_name(),
+                                    proto,
+                                    SystemTime::now(),
+                                ));
+                                let _ =
+                                    server.accept_inbound(message, RelayAuthorization::Forbidden);
+                                "250 OK message accepted\r\n"
+                            }
                         }
                         Err(_) => "554 message parse error\r\n",
                     },
@@ -474,28 +516,32 @@ pub async fn serve_inbound(stream: TcpStream, server: Arc<Server>) -> std::io::R
             continue;
         }
 
-        // STARTTLS: upgrade the socket, then reset the session (the client must
-        // re-issue EHLO over the encrypted channel, per RFC 3207).
-        if line.trim_end().eq_ignore_ascii_case("STARTTLS") {
-            match &tls {
+        // Command mode: SMTP commands are ASCII, so a lenient decode is safe here
+        // (only DATA body bytes, handled verbatim above, must never be re-encoded).
+        let line = String::from_utf8_lossy(&buf);
+        match SmtpCommand::parse(&line) {
+            // STARTTLS: validated through the command parser (so `STARTTLS junk` is
+            // a 500, not a silent upgrade) and the session state machine (so it is
+            // refused mid-transaction). On success, upgrade the socket and reset the
+            // session — the client re-issues EHLO over the encrypted channel.
+            Ok(SmtpCommand::StartTls) => match &tls {
                 Some(config) if matches!(conn.get_ref(), MaybeTlsStream::Plain(_)) => {
-                    if !conn.buffer().is_empty() {
+                    let reply = session.handle(SmtpCommand::StartTls);
+                    if reply.code != 220 {
+                        conn.write_all(reply.to_wire().as_bytes()).await?;
+                    } else if !conn.buffer().is_empty() {
                         conn.write_all(b"503 no pipelining before STARTTLS\r\n")
                             .await?;
-                        continue;
+                    } else {
+                        conn.write_all(b"220 Ready to start TLS\r\n").await?;
+                        conn = accept_tls(conn, Arc::clone(config)).await?;
+                        session = SmtpSession::new();
                     }
-                    conn.write_all(b"220 Ready to start TLS\r\n").await?;
-                    conn = accept_tls(conn, Arc::clone(config)).await?;
-                    session = SmtpSession::new();
                 }
                 _ => {
                     conn.write_all(b"502 STARTTLS not available\r\n").await?;
                 }
-            }
-            continue;
-        }
-
-        match SmtpCommand::parse(&line) {
+            },
             // EHLO/HELO: advertise STARTTLS as a multiline reply while still in
             // plaintext with TLS available; otherwise a plain greeting.
             Ok(command @ (SmtpCommand::Ehlo(_) | SmtpCommand::Helo(_))) => {
@@ -629,10 +675,9 @@ pub async fn serve_pop(
     };
 
     conn.write_all(b"+OK Snail POP3 ready\r\n").await?;
-    let mut line = String::new();
+    let mut buf: Vec<u8> = Vec::new();
     loop {
-        line.clear();
-        match read_line_capped(&mut conn, &mut line, MAX_LINE_LENGTH).await? {
+        match read_line_capped(&mut conn, &mut buf, MAX_LINE_LENGTH).await? {
             LineRead::Read => {}
             LineRead::Eof => break,
             LineRead::TooLong => {
@@ -640,6 +685,9 @@ pub async fn serve_pop(
                 break;
             }
         }
+        // POP3 commands are ASCII; a lenient decode is safe. (Message bytes flow
+        // the other way — see `write_pop_reply`, which emits them verbatim.)
+        let line = String::from_utf8_lossy(&buf);
         let is_quit = line.trim_end().eq_ignore_ascii_case("QUIT");
         match PopCommand::parse(&line) {
             // STLS: upgrade the socket, then resume in a fresh (encrypted)
@@ -702,7 +750,14 @@ async fn write_pop_reply<W: AsyncWrite + Unpin>(
     write
         .write_all(format!("{status} {}\r\n", reply.message).as_bytes())
         .await?;
-    if reply.ok && !reply.lines.is_empty() {
+    if !reply.ok {
+        return Ok(());
+    }
+    if let Some(body) = &reply.body {
+        // RETR: emit the raw message bytes verbatim, dot-stuffed and terminated
+        // (`mail::dot_stuff` appends the final `.\r\n`). No lossy re-encoding.
+        write.write_all(&mail::dot_stuff(body)).await?;
+    } else if !reply.lines.is_empty() {
         for line in &reply.lines {
             if line.starts_with('.') {
                 write.write_all(b".").await?; // dot-stuffing
@@ -733,10 +788,9 @@ pub async fn serve_imap(
     };
 
     conn.write_all(b"* OK Snail IMAP4rev1 ready\r\n").await?;
-    let mut line = String::new();
+    let mut buf: Vec<u8> = Vec::new();
     loop {
-        line.clear();
-        match read_line_capped(&mut conn, &mut line, MAX_LINE_LENGTH).await? {
+        match read_line_capped(&mut conn, &mut buf, MAX_LINE_LENGTH).await? {
             LineRead::Read => {}
             LineRead::Eof => break,
             LineRead::TooLong => {
@@ -744,6 +798,9 @@ pub async fn serve_imap(
                 break;
             }
         }
+        // IMAP command lines are ASCII; a lenient decode is safe. (FETCH literals
+        // flow out as raw bytes — see `write_imap_response`.)
+        let line = String::from_utf8_lossy(&buf);
         match TaggedCommand::parse(&line) {
             // STARTTLS: upgrade the socket, then resume in a fresh (encrypted)
             // session — the client re-issues commands over TLS (RFC 2595).
@@ -811,8 +868,9 @@ pub async fn serve_imap(
     Ok(())
 }
 
-/// Write an IMAP response: each untagged line as `* <line>`, then the tagged
-/// status line.
+/// Write an IMAP response: each untagged line as `* <line>`, then an optional
+/// binary `FETCH` literal (emitted verbatim, with the announced `{N}` length
+/// equal to the bytes written), then the tagged status line.
 async fn write_imap_response<W: AsyncWrite + Unpin>(
     write: &mut W,
     response: &ImapResponse,
@@ -821,6 +879,18 @@ async fn write_imap_response<W: AsyncWrite + Unpin>(
         write
             .write_all(format!("* {untagged}\r\n").as_bytes())
             .await?;
+    }
+    if let Some(lit) = &response.fetch_literal {
+        // RFC 3501 literal: `* <seq> FETCH (RFC822 {<len>}\r\n<octets>)\r\n`. The
+        // octets are written raw, so the declared length matches exactly and 8-bit
+        // content is never corrupted.
+        write
+            .write_all(
+                format!("* {} FETCH (RFC822 {{{}}}\r\n", lit.seq, lit.octets.len()).as_bytes(),
+            )
+            .await?;
+        write.write_all(&lit.octets).await?;
+        write.write_all(b")\r\n").await?;
     }
     write
         .write_all(format!("{}\r\n", response.status).as_bytes())
@@ -1645,5 +1715,214 @@ mod tests {
             reply.starts_with("* BAD"),
             "IMAP over-long line must be refused with * BAD, got {reply:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn tcp_inbound_then_pop_preserves_non_utf8_body_verbatim() {
+        use tokio::io::AsyncReadExt;
+
+        // End-to-end byte fidelity (#4): an 8-bit/binary body submitted over the
+        // wire must be stored and retrieved byte-for-byte — never lossily decoded
+        // (which would replace 0xE9/0xFF/0xFE with U+FFFD = EF BF BD and break DKIM).
+        let mut server = Server::new(&ServerConfig::new(["example.com".to_string()]));
+        server.register_user("bob@example.com", "pw").unwrap();
+        let server = Arc::new(server);
+
+        let inbound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pop = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let inbound_addr = inbound.local_addr().unwrap();
+        let pop_addr = pop.local_addr().unwrap();
+        {
+            let srv = Arc::clone(&server);
+            tokio::spawn(async move {
+                let (s, _) = inbound.accept().await.unwrap();
+                serve_inbound(s, srv).await.unwrap();
+            });
+        }
+        {
+            let srv = Arc::clone(&server);
+            tokio::spawn(async move {
+                let (s, peer) = pop.accept().await.unwrap();
+                serve_pop(s, peer, srv).await.unwrap();
+            });
+        }
+
+        // Deliver a message with a deliberately non-UTF-8 body over the inbound port.
+        let nonutf8: &[u8] = b"caf\xe9 \xff\xfe binary";
+        let client = TcpStream::connect(inbound_addr).await.unwrap();
+        let (cr, mut cw) = client.into_split();
+        let mut cr = BufReader::new(cr);
+        assert!(read_line(&mut cr).await.starts_with("220"));
+        for (cmd, expect) in [
+            ("EHLO mx.remote.net", "250"),
+            ("MAIL FROM:<alice@remote.net>", "250"),
+            ("RCPT TO:<bob@example.com>", "250"),
+            ("DATA", "354"),
+        ] {
+            cw.write_all(format!("{cmd}\r\n").as_bytes()).await.unwrap();
+            assert!(read_line(&mut cr).await.starts_with(expect), "cmd {cmd}");
+        }
+        cw.write_all(b"Subject: bin\r\n\r\n").await.unwrap();
+        cw.write_all(nonutf8).await.unwrap();
+        cw.write_all(b"\r\n.\r\n").await.unwrap();
+        assert!(read_line(&mut cr).await.starts_with("250"));
+        cw.write_all(b"QUIT\r\n").await.unwrap();
+
+        // Retrieve it over POP3, reading the RETR response as RAW bytes.
+        let client = TcpStream::connect(pop_addr).await.unwrap();
+        let (cr, mut cw) = client.into_split();
+        let mut cr = BufReader::new(cr);
+        assert!(read_line(&mut cr).await.starts_with("+OK"));
+        cw.write_all(b"USER bob@example.com\r\n").await.unwrap();
+        assert!(read_line(&mut cr).await.starts_with("+OK"));
+        cw.write_all(b"PASS pw\r\n").await.unwrap();
+        assert!(read_line(&mut cr).await.starts_with("+OK"));
+        cw.write_all(b"RETR 1\r\nQUIT\r\n").await.unwrap();
+
+        // Read everything remaining as bytes (status line + body + terminator + bye).
+        let mut raw = Vec::new();
+        cr.read_to_end(&mut raw).await.unwrap();
+        assert!(
+            !raw.windows(3).any(|w| w == [0xEF, 0xBF, 0xBD]),
+            "no U+FFFD replacement bytes — the body must not have been lossily decoded"
+        );
+        assert!(
+            raw.windows(nonutf8.len()).any(|w| w == nonutf8),
+            "the verbatim 8-bit body must appear in the RETR response"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_inbound_prepends_received_trace_header() {
+        // #2: every accepted inbound message gets a `Received:` trace header
+        // stamped at the top, naming the HELO sender and this host.
+        let server = Arc::new(Server::new(&ServerConfig::new(["example.com".to_string()])));
+        let inbound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = inbound.local_addr().unwrap();
+        {
+            let srv = Arc::clone(&server);
+            tokio::spawn(async move {
+                let (s, _) = inbound.accept().await.unwrap();
+                serve_inbound(s, srv).await.unwrap();
+            });
+        }
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (cr, mut cw) = client.into_split();
+        let mut cr = BufReader::new(cr);
+        assert!(read_line(&mut cr).await.starts_with("220"));
+        for (cmd, expect) in [
+            ("EHLO mx.remote.net", "250"),
+            ("MAIL FROM:<alice@remote.net>", "250"),
+            ("RCPT TO:<bob@example.com>", "250"),
+            ("DATA", "354"),
+        ] {
+            cw.write_all(format!("{cmd}\r\n").as_bytes()).await.unwrap();
+            assert!(read_line(&mut cr).await.starts_with(expect), "cmd {cmd}");
+        }
+        cw.write_all(b"Subject: hi\r\n\r\nbody\r\n.\r\n")
+            .await
+            .unwrap();
+        assert!(read_line(&mut cr).await.starts_with("250")); // store now updated
+
+        let stored = server.store().list("bob@example.com");
+        assert_eq!(stored.len(), 1);
+        let text = String::from_utf8_lossy(&stored[0].message.to_bytes()).into_owned();
+        assert!(
+            text.starts_with("Received: from mx.remote.net by example.com with ESMTP;"),
+            "expected a Received trace header at the top, got: {text:?}"
+        );
+        // The original content is preserved after the prepended hop.
+        assert!(text.contains("Subject: hi"));
+        assert!(text.contains("body"));
+    }
+
+    #[tokio::test]
+    async fn tcp_inbound_rejects_message_exceeding_hop_limit() {
+        // #2: a message arriving with >= MAX_RECEIVED_HOPS Received headers is a
+        // mail loop and must be refused (554), not delivered/relayed onward.
+        let server = Arc::new(Server::new(&ServerConfig::new(["example.com".to_string()])));
+        let inbound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = inbound.local_addr().unwrap();
+        {
+            let srv = Arc::clone(&server);
+            tokio::spawn(async move {
+                let (s, _) = inbound.accept().await.unwrap();
+                serve_inbound(s, srv).await.unwrap();
+            });
+        }
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (cr, mut cw) = client.into_split();
+        let mut cr = BufReader::new(cr);
+        assert!(read_line(&mut cr).await.starts_with("220"));
+        for (cmd, expect) in [
+            ("EHLO mx.loop.test", "250"),
+            ("MAIL FROM:<a@loop.test>", "250"),
+            ("RCPT TO:<bob@example.com>", "250"),
+            ("DATA", "354"),
+        ] {
+            cw.write_all(format!("{cmd}\r\n").as_bytes()).await.unwrap();
+            assert!(read_line(&mut cr).await.starts_with(expect), "cmd {cmd}");
+        }
+        // Build a DATA body already carrying MAX_RECEIVED_HOPS Received headers.
+        let mut data = String::new();
+        for i in 0..MAX_RECEIVED_HOPS {
+            data.push_str(&format!("Received: by hop{i}.test; loop\r\n"));
+        }
+        data.push_str("Subject: looping\r\n\r\nbody\r\n.\r\n");
+        cw.write_all(data.as_bytes()).await.unwrap();
+        assert!(
+            read_line(&mut cr).await.starts_with("554"),
+            "a message exceeding the hop limit must be refused with 554"
+        );
+        assert_eq!(
+            server.store().count("bob@example.com"),
+            0,
+            "a looping message must not be delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_starttls_refused_with_args_and_mid_transaction() {
+        // STARTTLS now flows through the command parser + session state machine:
+        // a trailing argument is malformed (500), and STARTTLS once a transaction
+        // is underway is refused (503) — never a silent upgrade in either case.
+        let (_cert_pem, certs) = localhost_certs();
+        let server = Arc::new(
+            Server::new(&ServerConfig::new(["example.com".to_string()]))
+                .with_tls(&certs)
+                .unwrap(),
+        );
+        let inbound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = inbound.local_addr().unwrap();
+        {
+            let srv = Arc::clone(&server);
+            tokio::spawn(async move {
+                let (s, _) = inbound.accept().await.unwrap();
+                serve_inbound(s, srv).await.unwrap();
+            });
+        }
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (cr, mut cw) = client.into_split();
+        let mut cr = BufReader::new(cr);
+        assert!(read_line(&mut cr).await.starts_with("220"));
+
+        // EHLO advertises STARTTLS (TLS is configured).
+        cw.write_all(b"EHLO mx.test\r\n").await.unwrap();
+        assert!(read_line(&mut cr).await.starts_with("250-"));
+        assert!(read_line(&mut cr).await.contains("STARTTLS"));
+
+        // `STARTTLS now` is malformed → 500, and the connection stays plaintext.
+        cw.write_all(b"STARTTLS now\r\n").await.unwrap();
+        assert!(read_line(&mut cr).await.starts_with("500"));
+
+        // Open a transaction, then STARTTLS must be refused with 503.
+        cw.write_all(b"MAIL FROM:<a@remote.test>\r\n")
+            .await
+            .unwrap();
+        assert!(read_line(&mut cr).await.starts_with("250"));
+        cw.write_all(b"STARTTLS\r\n").await.unwrap();
+        assert!(read_line(&mut cr).await.starts_with("503"));
+        cw.write_all(b"QUIT\r\n").await.unwrap();
     }
 }
