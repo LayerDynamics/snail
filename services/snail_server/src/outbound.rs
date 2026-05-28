@@ -4,6 +4,7 @@
 //! the result for the retry spool. MX resolution lives in [`crate::relay`]; this
 //! is the single-target transmit.
 
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -298,7 +299,9 @@ pub async fn relay_to(
 /// domain drives the lookup.
 ///
 /// A domain with no MX falls back to its A/AAAA record as an implicit MX
-/// (RFC 5321 §5.1). The first exchange to deliver wins; a permanent (`5xx`)
+/// (RFC 5321 §5.1). Each exchange is then resolved to its IP address(es) through
+/// the same `resolver` (so the final hop no longer relies on the OS resolver at
+/// connect time). The first exchange to deliver wins; a permanent (`5xx`)
 /// rejection stops immediately; otherwise the last transient outcome is
 /// returned so the caller can retry.
 ///
@@ -361,20 +364,50 @@ pub async fn relay(
         if mx.is_null() {
             continue;
         }
-        let addr = format!("{}:{}", mx.exchange, port);
-        match relay_to(&addr, &mx.exchange, helo, message, tls).await {
-            Ok(RelayReport::Delivered) => return RelayReport::Delivered,
-            Ok(failed @ RelayReport::Failed { .. }) => return failed, // permanent; stop
-            Ok(deferred) => last = deferred,                          // try the next MX
-            Err(error) => {
-                last = RelayReport::Deferred {
-                    code: 0,
-                    text: format!("{addr}: {error}"),
-                };
+        // Resolve the exchange to address(es) through the same (hickory) resolver
+        // rather than letting the OS resolver do the final hop at connect time.
+        // An address-literal exchange is used directly; the hostname is still used
+        // as the TLS server name when STARTTLS upgrades.
+        let addresses = match resolve_exchange(resolver, &mx.exchange).await {
+            Ok(addrs) => addrs,
+            Err(text) => {
+                last = RelayReport::Deferred { code: 0, text };
+                continue;
+            }
+        };
+        for ip in addresses {
+            let addr = SocketAddr::new(ip, port).to_string();
+            match relay_to(&addr, &mx.exchange, helo, message, tls).await {
+                Ok(RelayReport::Delivered) => return RelayReport::Delivered,
+                Ok(failed @ RelayReport::Failed { .. }) => return failed, // permanent; stop
+                Ok(deferred) => last = deferred, // try the next address / MX
+                Err(error) => {
+                    last = RelayReport::Deferred {
+                        code: 0,
+                        text: format!("{addr}: {error}"),
+                    };
+                }
             }
         }
     }
     last
+}
+
+/// Resolve an MX exchange to its IP address(es) via `resolver`. An address-literal
+/// exchange is returned verbatim (no lookup); a hostname is resolved through
+/// hickory's A/AAAA lookup. An empty/failed lookup is a transient condition.
+async fn resolve_exchange(
+    resolver: &dyn DnsResolver,
+    exchange: &str,
+) -> std::result::Result<Vec<IpAddr>, String> {
+    if let Ok(ip) = exchange.parse::<IpAddr>() {
+        return Ok(vec![ip]);
+    }
+    match resolver.lookup_ip(exchange).await {
+        Ok(records) if !records.is_empty() => Ok(records.iter().map(|r| r.0).collect()),
+        Ok(_) => Err(format!("no A/AAAA address for MX {exchange}")),
+        Err(error) => Err(format!("address lookup for MX {exchange}: {error}")),
+    }
 }
 
 #[cfg(test)]
@@ -750,6 +783,91 @@ mod tests {
         assert!(
             matches!(report, RelayReport::Failed { .. }),
             "a null MX must be a permanent failure, got {report:?}"
+        );
+    }
+
+    /// A resolver whose MX is a *hostname* (`mx.test`) that A-resolves to loopback,
+    /// exercising the hickory MX→IP final hop (the OS resolver could not resolve
+    /// `mx.test`, so delivery proves the address came from this resolver).
+    struct HostnameMxResolver;
+
+    #[async_trait::async_trait]
+    impl network::DnsResolver for HostnameMxResolver {
+        async fn lookup_mx(&self, _domain: &str) -> network::Result<Vec<MxRecord>> {
+            Ok(vec![MxRecord {
+                preference: 10,
+                exchange: "mx.test".to_string(),
+            }])
+        }
+        async fn lookup_ip(&self, host: &str) -> network::Result<Vec<network::AddressRecord>> {
+            if host == "mx.test" {
+                Ok(vec![network::AddressRecord("127.0.0.1".parse().unwrap())])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+        async fn lookup_txt(&self, _name: &str) -> network::Result<Vec<network::TxtRecord>> {
+            Ok(Vec::new())
+        }
+        async fn reverse_lookup(
+            &self,
+            _ip: std::net::IpAddr,
+        ) -> network::Result<Vec<network::PtrRecord>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_resolves_hostname_mx_via_resolver_and_delivers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(stub_receiver(listener));
+
+        // The MX `mx.test` is resolved to loopback through the resolver (not the OS
+        // resolver), then connected to at the relay port.
+        let report = relay(
+            &HostnameMxResolver,
+            "relay.example.com",
+            port,
+            &message(),
+            None,
+        )
+        .await;
+        assert_eq!(report, RelayReport::Delivered);
+
+        let body = server.await.unwrap();
+        assert!(body.contains("hello world"));
+    }
+
+    #[tokio::test]
+    async fn relay_defers_when_mx_host_has_no_address() {
+        // An MX hostname that resolves to no address is a transient condition.
+        struct NoAddr;
+        #[async_trait::async_trait]
+        impl network::DnsResolver for NoAddr {
+            async fn lookup_mx(&self, _d: &str) -> network::Result<Vec<MxRecord>> {
+                Ok(vec![MxRecord {
+                    preference: 10,
+                    exchange: "mx.test".to_string(),
+                }])
+            }
+            async fn lookup_ip(&self, _h: &str) -> network::Result<Vec<network::AddressRecord>> {
+                Ok(Vec::new())
+            }
+            async fn lookup_txt(&self, _n: &str) -> network::Result<Vec<network::TxtRecord>> {
+                Ok(Vec::new())
+            }
+            async fn reverse_lookup(
+                &self,
+                _ip: std::net::IpAddr,
+            ) -> network::Result<Vec<network::PtrRecord>> {
+                Ok(Vec::new())
+            }
+        }
+        let report = relay(&NoAddr, "relay.example.com", 25, &message(), None).await;
+        assert!(
+            matches!(report, RelayReport::Deferred { .. }),
+            "an MX with no address is transient, got {report:?}"
         );
     }
 
