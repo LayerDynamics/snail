@@ -204,6 +204,13 @@ impl SmtpSession {
         self.helo.as_deref()
     }
 
+    /// The current transaction's `MAIL FROM` reverse-path, if one has been given.
+    /// Used (with the recipient + source IP) as the greylisting triplet.
+    #[must_use]
+    pub fn sender(&self) -> Option<&Mailbox> {
+        self.sender.as_ref()
+    }
+
     /// Handle a command, advancing state and returning the reply to send. When
     /// `DATA` is accepted the phase becomes [`Phase::Data`]; the caller then
     /// reads body lines and calls [`Self::take_envelope`] for the result.

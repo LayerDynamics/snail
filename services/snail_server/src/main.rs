@@ -14,6 +14,7 @@
 //! - `SNAIL_TLS_CERT`/`SNAIL_TLS_KEY` — PEM cert+key paths for STARTTLS (self-signed generated if unset)
 //! - `SNAIL_SPF_ENFORCE`       — reject (550) inbound mail on SPF `Fail` (default off: stamp `Received-SPF` only)
 //! - `SNAIL_DMARC_ENFORCE`     — reject (550) inbound mail on a DMARC `reject` disposition (default off: stamp only)
+//! - `SNAIL_GREYLIST`          — greylist the inbound port: defer (451) first contact for an unseen triplet (default off)
 //!
 //! `SNAIL_DATA_DIR` / `SNAIL_LOG` are read via `utilities::Config`.
 
@@ -81,6 +82,14 @@ async fn main() -> anyhow::Result<()> {
         auth = server.resolver().is_some(),
         "inbound message authentication configured"
     );
+
+    // Optional greylisting on the inbound port (off by default): defers the first
+    // delivery for an unseen (network, sender, recipient) triplet.
+    let greylist = env_flag("SNAIL_GREYLIST");
+    if greylist {
+        server = server.with_greylist(security::GreylistConfig::default());
+        tracing::info!("inbound greylisting enabled");
+    }
 
     if let Ok(users) = std::env::var("SNAIL_USERS") {
         for entry in users.split(',').filter(|e| !e.trim().is_empty()) {

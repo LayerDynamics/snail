@@ -13,8 +13,8 @@ use mail::{
 };
 use network::DnsResolver;
 use security::{
-    AuthThrottle, Credential, CredentialStore, Firewall, FirewallConfig, MemoryCredentialStore,
-    ThrottleConfig,
+    AuthThrottle, Credential, CredentialStore, Firewall, FirewallConfig, Greylist, GreylistConfig,
+    MemoryCredentialStore, ThrottleConfig,
 };
 
 use crate::config::ServerConfig;
@@ -90,6 +90,9 @@ pub struct Server {
     dmarc_enforce: bool,
     /// Accumulates DMARC results for periodic aggregate (`rua`) reporting.
     dmarc_aggregator: Arc<crate::dmarc_report::DmarcAggregator>,
+    /// Optional greylisting on the no-auth inbound port (off by default): defers
+    /// the first delivery for an unseen `(network, sender, recipient)` triplet.
+    greylist: Option<Arc<Greylist>>,
 }
 
 impl Server {
@@ -120,6 +123,7 @@ impl Server {
             spf_enforce: false,
             dmarc_enforce: false,
             dmarc_aggregator: Arc::new(crate::dmarc_report::DmarcAggregator::new()),
+            greylist: None,
         }
     }
 
@@ -245,6 +249,20 @@ impl Server {
     #[must_use]
     pub fn dmarc_aggregator(&self) -> &Arc<crate::dmarc_report::DmarcAggregator> {
         &self.dmarc_aggregator
+    }
+
+    /// Enable greylisting on the inbound port with the given policy (off by
+    /// default). The first attempt for an unseen triplet is deferred (`451`).
+    #[must_use]
+    pub fn with_greylist(mut self, config: GreylistConfig) -> Self {
+        self.greylist = Some(Arc::new(Greylist::new(config)));
+        self
+    }
+
+    /// The greylist, if enabled.
+    #[must_use]
+    pub fn greylist(&self) -> Option<&Greylist> {
+        self.greylist.as_deref()
     }
 
     /// Override the relay connection port (no-op if relay is not enabled).

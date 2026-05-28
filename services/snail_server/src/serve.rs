@@ -706,6 +706,24 @@ pub async fn serve_inbound(
                 conn.write_all(format!("550 <{rcpt}> relay not permitted\r\n").as_bytes())
                     .await?;
             }
+            // Greylisting: defer the first attempt for an unseen triplet so a
+            // legitimate sender retries (RFC 6647). Applies only to the no-auth
+            // inbound port and only when enabled.
+            Ok(SmtpCommand::RcptTo(ref rcpt))
+                if server.greylist().is_some_and(|gl| {
+                    let sender = session
+                        .sender()
+                        .map(ToString::to_string)
+                        .unwrap_or_default();
+                    matches!(
+                        gl.check(peer.ip(), &sender, &rcpt.to_string()),
+                        security::GreyDecision::Defer
+                    )
+                }) =>
+            {
+                conn.write_all(b"451 4.7.1 greylisted; please retry later\r\n")
+                    .await?;
+            }
             Ok(command) => {
                 let is_quit = matches!(command, SmtpCommand::Quit);
                 let reply = session.handle(command);
@@ -2286,6 +2304,51 @@ mod tests {
             server.store().count("bob@example.com"),
             0,
             "a DMARC-rejected message must not be delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_inbound_greylists_first_contact() {
+        // With greylisting enabled, the first RCPT for an unseen triplet is
+        // deferred (451) and not delivered; a legitimate sender retries later.
+        use security::GreylistConfig;
+        let server = Arc::new(
+            Server::new(&ServerConfig::new(["example.com".to_string()]))
+                .with_greylist(GreylistConfig::default()),
+        );
+        let inbound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = inbound.local_addr().unwrap();
+        {
+            let srv = Arc::clone(&server);
+            tokio::spawn(async move {
+                let (s, peer) = inbound.accept().await.unwrap();
+                serve_inbound(s, peer, srv).await.unwrap();
+            });
+        }
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (cr, mut cw) = client.into_split();
+        let mut cr = BufReader::new(cr);
+        assert!(read_line(&mut cr).await.starts_with("220"));
+        for (cmd, expect) in [
+            ("EHLO mx.remote.net", "250"),
+            ("MAIL FROM:<alice@remote.net>", "250"),
+        ] {
+            cw.write_all(format!("{cmd}\r\n").as_bytes()).await.unwrap();
+            assert!(read_line(&mut cr).await.starts_with(expect), "cmd {cmd}");
+        }
+        cw.write_all(b"RCPT TO:<bob@example.com>\r\n")
+            .await
+            .unwrap();
+        let reply = read_line(&mut cr).await;
+        assert!(
+            reply.starts_with("451") && reply.contains("greylist"),
+            "first contact must be greylisted, got: {reply}"
+        );
+        cw.write_all(b"QUIT\r\n").await.unwrap();
+        assert_eq!(
+            server.store().count("bob@example.com"),
+            0,
+            "a greylisted recipient is not delivered to"
         );
     }
 
